@@ -23,6 +23,13 @@ except ImportError:
     print("错误: 缺少 requests 库，请先执行: pip install requests")
     sys.exit(1)
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # ==============================
 # 配置参数（支持环境变量与默认值）
 # ==============================
@@ -57,22 +64,23 @@ def get_access_token():
     if env_token:
         return env_token.strip()
 
-    # 1. 优先尝试从 Cloud Run 元数据服务器获取
-    try:
-        r = requests.get(
-            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-            headers={"Metadata-Flavor": "Google"},
-            timeout=2
-        )
-        if r.status_code == 200:
-            return r.json().get("access_token")
-    except Exception:
-        pass
+    # 1. 优先尝试从 Cloud Run 元数据服务器获取（仅在容器或明确 GCP 环境）
+    if os.environ.get("K_SERVICE") or os.environ.get("CLOUD_RUN_JOB"):
+        try:
+            r = requests.get(
+                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+                headers={"Metadata-Flavor": "Google"},
+                timeout=2
+            )
+            if r.status_code == 200:
+                return r.json().get("access_token")
+        except Exception:
+            pass
 
     # 2. 从本地 / Cloud Shell gcloud 获取
     import subprocess
     cmd = ["gcloud", "auth", "print-access-token"]
-    return subprocess.check_output(cmd, text=True).strip()
+    return subprocess.check_output(cmd, text=True, shell=(sys.platform == "win32")).strip()
 
 
 def build_http_session(token):
