@@ -1,0 +1,28 @@
+# GCP Service Account keys & credentials
+*.json
+!lifecycle.json
+credentials/
+*.key
+*.pem
+*.token
+
+# Python cache & virtualenvs
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Claude / Agent logs & scratch
+.claude/
+*.tmp
+/tmp/
+logs/
+*.log
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

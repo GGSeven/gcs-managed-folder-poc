@@ -1,0 +1,12 @@
+{
+  "rule": [
+    {
+      "action": { "type": "SetStorageClass", "storageClass": "COLDLINE" },
+      "condition": { "age": 60, "matchesPrefix": ["warehouse/odc.db/"] }
+    },
+    {
+      "action": { "type": "SetStorageClass", "storageClass": "ARCHIVE" },
+      "condition": { "age": 365, "matchesPrefix": ["warehouse/odc.db/"] }
+    }
+  ]
+}
