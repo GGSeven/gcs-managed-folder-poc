@@ -1,0 +1,11 @@
+.git
+.gitignore
+*.env
+*.sh
+*.md
+*.pyc
+__pycache__
+*.parquet
+*.txt
+.cache
+env_vars.yaml

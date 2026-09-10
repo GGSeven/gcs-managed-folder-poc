@@ -1,23 +1,33 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # GCS Managed Folder 调和引擎一键云端部署脚本 (deploy.sh)
-# 作用：
-#   1. 自动启用所需的 GCP API 服务
-#   2. 创建 Artifact Registry Docker 仓库
-#   3. 通过 Cloud Build 构建并推送 Python 高性能调和引擎镜像
-#   4. 部署/更新 Cloud Run Job (mf-reconcile)，配置生产增量滑动窗口参数
-#   5. 授权并配置 Cloud Scheduler 每日定时触发作业
+# 特性：
+#   1. 支持直接使用当前 Shell export 的环境变量（无需强制依赖 config.env 文件）
+#   2. 自动隔离临时构建目录（避免将 Cloud Shell 家目录 1GB+ 无关文件打包上传 Cloud Build）
+#   3. 一键完成 API 启用、镜像构建、Cloud Run Job 部署、Cloud Scheduler 定时配置
 # ==============================================================================
 set -euo pipefail
-cd "$(dirname "$0")"
 
-# 1. 加载环境变量
+# 1. 加载环境变量（兼容直接 export 或通过 config.env 加载）
 if [[ -f ./config.env ]]; then
   source ./config.env
-else
-  echo "❌ 错误: 未找到 config.env 配置文件，请先配置环境变量！"
+fi
+
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}"
+if [[ -z "${PROJECT_ID}" ]]; then
+  echo "❌ 错误: 未检测到 PROJECT_ID，请先执行: export PROJECT_ID=您的项目ID"
   exit 1
 fi
+
+REGION="${REGION:-asia-east1}"
+BUCKET="${BUCKET:-gs://${PROJECT_ID}-mf-poc}}"
+DATA_ROOT_PREFIX="${DATA_ROOT_PREFIX:-datasets}"
+HOT_DAYS="${HOT_DAYS:-60}"
+
+HOT_SA="${HOT_SA:-iceberg-hot-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
+COLD_SA="${COLD_SA:-iceberg-cold-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
+WRITER_SA="${WRITER_SA:-iceberg-writer@${PROJECT_ID}.iam.gserviceaccount.com}"
+OPS_SA="${OPS_SA:-mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com}"
 
 JOB_NAME="mf-reconcile"
 REPO_NAME="mf-poc"
@@ -55,14 +65,29 @@ else
   echo "    ✔ 代码库 ${REPO_NAME} 已存在，跳过创建"
 fi
 
-# 4. 构建并推送容器镜像
+# 4. 构建并推送容器镜像（极速模式：隔离构建上下文，仅打包 Dockerfile 和 Python 脚本）
 echo -e "\n==> [3/5] 使用 Cloud Build 构建并推送镜像..."
 echo "    镜像标签: ${IMAGE}"
-gcloud builds submit --tag "${IMAGE}" --project="${PROJECT_ID}" .
+
+BUILD_DIR=$(mktemp -d)
+trap 'rm -rf "${BUILD_DIR}"' EXIT
+
+cp Dockerfile reconcile_fast.py "${BUILD_DIR}/"
+cat << 'EOF' > "${BUILD_DIR}/.gcloudignore"
+.git
+.gitignore
+*.env
+*.sh
+*.md
+EOF
+
+echo "    ✔ 构建上下文已隔离，准备上传核心脚本 (大小: <50KB)..."
+gcloud builds submit "${BUILD_DIR}" --tag "${IMAGE}" --project="${PROJECT_ID}"
 
 # 5. 部署 Cloud Run Job
 echo -e "\n==> [4/5] 部署/更新 Cloud Run Job [${JOB_NAME}]..."
-cat > env_vars.yaml <<EOF
+ENV_FILE="${BUILD_DIR}/env_vars.yaml"
+cat > "${ENV_FILE}" <<EOF
 PROJECT_ID: "${PROJECT_ID}"
 REGION: "${REGION}"
 BUCKET: "${BUCKET}"
@@ -85,7 +110,7 @@ gcloud run jobs deploy "${JOB_NAME}" \
   --memory=1Gi \
   --max-retries=0 \
   --task-timeout=10m \
-  --env-vars-file="env_vars.yaml"
+  --env-vars-file="${ENV_FILE}"
 
 # 6. 配置 Cloud Scheduler 每日定时作业
 echo -e "\n==> [5/5] 配置 Cloud Scheduler 每日定时作业 [${JOB_NAME}-daily]..."

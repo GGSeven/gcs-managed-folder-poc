@@ -10,13 +10,30 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# 加载配置变量
+# 加载配置变量（兼容直接 export 或通过 config.env 加载）
 if [[ -f ./config.env ]]; then
   source ./config.env
-else
-  echo "❌ 错误: 未找到 config.env 配置文件，请先配置环境变量！"
+fi
+
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}"
+if [[ -z "${PROJECT_ID}" ]]; then
+  echo "❌ 错误: 未检测到 PROJECT_ID，请先执行: export PROJECT_ID=您的项目ID"
   exit 1
 fi
+
+REGION="${REGION:-asia-east1}"
+BUCKET="${BUCKET:-gs://${PROJECT_ID}-mf-poc}}"
+DATA_ROOT_PREFIX="${DATA_ROOT_PREFIX:-datasets}"
+HOT_DAYS="${HOT_DAYS:-60}"
+FOLDER_DATE_FORMAT="${FOLDER_DATE_FORMAT:-dt=%Y-%m-%d}"
+
+HOT_SA="${HOT_SA:-iceberg-hot-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
+COLD_SA="${COLD_SA:-iceberg-cold-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
+WRITER_SA="${WRITER_SA:-iceberg-writer@${PROJECT_ID}.iam.gserviceaccount.com}"
+OPS_SA="${OPS_SA:-mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com}"
+
+WRITER_ROLE="${WRITER_ROLE:-roles/storage.objectUser}"
+OPS_ROLE_ID="${OPS_ROLE_ID:-mfReconciler}"
 
 echo "========================================================================="
 echo "🚀 开始初始化 GCS Managed Folder 基础环境与 IAM 配置"
