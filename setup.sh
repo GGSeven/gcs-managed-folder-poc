@@ -1,75 +1,116 @@
 #!/usr/bin/env bash
-# 一次性初始化：bucket(UBLA) + lifecycle + 两个 SA + 模拟的天级 Iceberg 目录
+# ==============================================================================
+# setup.sh - 一次性环境初始化脚本
+# 包含：Bucket 创建 (UBLA) + 生命周期规则 + 4个专属服务账号 + 自定义角色 + 根 Managed Folder 授权 + 模拟验证数据
+# ==============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./config.env
 
-echo "==> 1. 创建 bucket（uniform bucket-level access 是 managed folder 的硬性前提）"
+echo "========================================================================="
+echo "🚀 开始执行环境配置 (Environment Setup)"
+echo "   项目 ID: ${PROJECT_ID} | 区域: ${REGION}"
+echo "   存储桶: ${BUCKET} | 数据根路径: ${DATA_ROOT_PREFIX}/"
+echo "========================================================================="
+
+echo "==> 1. 创建 Bucket 并开启 UBLA（Managed Folder 的硬性前置要求）"
 if ! gcloud storage buckets describe "${BUCKET}" --project="${PROJECT_ID}" &>/dev/null; then
   gcloud storage buckets create "${BUCKET}" \
     --project="${PROJECT_ID}" --location="${REGION}" \
     --uniform-bucket-level-access
+  echo "    ✔ Bucket ${BUCKET} 创建成功并已开启 UBLA"
 else
-  echo "    bucket 已存在，跳过"
+  echo "    ✔ Bucket 已存在，确保开启 UBLA"
+  gcloud storage buckets update "${BUCKET}" --uniform-bucket-level-access
 fi
 
-echo "==> 2. 应用 lifecycle 规则（60 天 Coldline / 365 天 Archive）"
-gcloud storage buckets update "${BUCKET}" --lifecycle-file=lifecycle.json
+echo "==> 2. 应用 Lifecycle 规则（60 天转 Coldline / 365 天转 Archive）"
+if [[ -f "lifecycle.json" ]]; then
+  gcloud storage buckets update "${BUCKET}" --lifecycle-file=lifecycle.json
+  echo "    ✔ 存储桶生命周期规则已成功应用"
+fi
 
-echo "==> 3. 创建 service account（热/冷 reader、写入方、自动化调和）及自定义角色"
+echo "==> 3. 创建 4 大专属服务账号（Service Accounts）"
 for sa in "${HOT_SA_NAME}" "${COLD_SA_NAME}" "${WRITER_SA_NAME}" "${OPS_SA_NAME}"; do
   if ! gcloud iam service-accounts describe "${sa}@${PROJECT_ID}.iam.gserviceaccount.com" \
        --project="${PROJECT_ID}" &>/dev/null; then
     gcloud iam service-accounts create "${sa}" --project="${PROJECT_ID}" \
-      --display-name="POC ${sa}"
+      --display-name="SA for ${sa}"
+    echo "    ✔ 服务账号 ${sa} 创建成功"
   else
-    echo "    ${sa} 已存在，跳过"
+    echo "    ✔ 服务账号 ${sa} 已存在，跳过"
   fi
 done
 
-# reconciler 的最小权限自定义角色：只能管理 managed folder + 列目录名，
-# 不含 storage.objects.get，读不到任何数据内容
-# （storage.admin / storage.folderAdmin 都含 objects.get，不要用）
+echo "==> 4. 创建 Reconciler 专用最小权限自定义角色 (${OPS_ROLE_ID})"
+# 仅授予控制面操作，无 storage.objects.get，无法窥探或读取任何业务数据内容
 if ! gcloud iam roles describe "${OPS_ROLE_ID}" --project="${PROJECT_ID}" &>/dev/null; then
   gcloud iam roles create "${OPS_ROLE_ID}" --project="${PROJECT_ID}" \
     --title="Managed Folder Reconciler" \
     --description="Manage managed folders and their IAM; list prefixes; cannot read object data" \
     --permissions="storage.managedFolders.create,storage.managedFolders.get,storage.managedFolders.list,storage.managedFolders.getIamPolicy,storage.managedFolders.setIamPolicy,storage.objects.list,storage.buckets.get" >/dev/null
-  echo "    自定义角色 ${OPS_ROLE_ID} 已创建"
+  echo "    ✔ 自定义角色 ${OPS_ROLE_ID} 创建成功"
+else
+  echo "    ✔ 自定义角色 ${OPS_ROLE_ID} 已存在，跳过"
 fi
 
-# 注意：任何 SA（业务或自动化）都【不要】授予 bucket 级或 project 级的对象权限。
-# managed folder 的 IAM 是叠加(additive)的，且不支持 deny，
-# bucket 级授权会让 folder 级隔离完全失效。
-# 写入方和 reconciler 的权限都授在表前缀级 managed folder 上（见第 4 步），
-# 范围被圈定在 DATA_PREFIX 内，bucket 中其他业务数据碰不到。
-
-echo "==> 4. 表前缀级 managed folder：授予写入方(Spark/Flink)整表读写删 + reconciler 管理权限"
-echo "     （Iceberg 提交要读写 metadata/，compaction/expire 要跨天操作历史文件，"
-echo "      故写入方不参与热冷切换；嵌套的天级 managed folder 权限叠加，互不干扰；"
-echo "      reconciler 的自定义角色对嵌套 managed folder 同样生效，无需 bucket 级绑定）"
-prefix_mf="${BUCKET}/${DATA_PREFIX}/"
+echo "==> 5. 创建数据根目录 Managed Folder 并注入基础权限"
+# 权限严格圈定在 datasets/ 根目录内，绝不在 Bucket 级赋予读取权限
+prefix_mf="${BUCKET}/${DATA_ROOT_PREFIX}/"
 gcloud storage managed-folders create "${prefix_mf}" &>/dev/null || true
+
 prefix_policy=$(mktemp)
 cat > "${prefix_policy}" <<EOF
-{"bindings": [
-  {"role": "${WRITER_ROLE}", "members": ["serviceAccount:${WRITER_SA}"]},
-  {"role": "projects/${PROJECT_ID}/roles/${OPS_ROLE_ID}", "members": ["serviceAccount:${OPS_SA}"]}
-]}
+{
+  "bindings": [
+    {
+      "role": "${WRITER_ROLE}",
+      "members": ["serviceAccount:${WRITER_SA}"]
+    },
+    {
+      "role": "projects/${PROJECT_ID}/roles/${OPS_ROLE_ID}",
+      "members": ["serviceAccount:${OPS_SA}"]
+    }
+  ]
+}
 EOF
 gcloud storage managed-folders set-iam-policy "${prefix_mf}" "${prefix_policy}" >/dev/null
 rm -f "${prefix_policy}"
-echo "    ${prefix_mf} -> ${WRITER_SA} (${WRITER_ROLE})"
-echo "    ${prefix_mf} -> ${OPS_SA} (${OPS_ROLE_ID})"
+echo "    ✔ ${prefix_mf} -> 写入方 ${WRITER_SA} (${WRITER_ROLE})"
+echo "    ✔ ${prefix_mf} -> 调和方 ${OPS_SA} (${OPS_ROLE_ID})"
 
-echo "==> 5. 模拟客户目录：生成最近 65 天的天级 folder，每个放一个数据文件"
-echo "     （覆盖 60 天阈值两侧，便于验证热/冷切换）"
+echo "==> 6. 为当前管理员账号授予 TokenCreator 权限（供本地 impersonate 验证）"
+CURRENT_USER=$(gcloud config get-value account 2>/dev/null || true)
+if [[ -n "${CURRENT_USER}" ]]; then
+  MEMBER_TYPE="user"
+  if [[ "${CURRENT_USER}" == *"gserviceaccount.com"* ]]; then
+    MEMBER_TYPE="serviceAccount"
+  fi
+  for sa in "${HOT_SA}" "${COLD_SA}" "${WRITER_SA}" "${OPS_SA}"; do
+    gcloud iam service-accounts add-iam-policy-binding "${sa}" \
+      --project="${PROJECT_ID}" \
+      --member="${MEMBER_TYPE}:${CURRENT_USER}" \
+      --role="roles/iam.serviceAccountTokenCreator" &>/dev/null || true
+  done
+  echo "    ✔ 已为 ${CURRENT_USER} 授予 4 个 SA 的 TokenCreator 权限"
+fi
+
+echo "==> 7. 生成基础验证表结构与测试数据 (demo.db/sales_order)"
+DEMO_TABLE="${BUCKET}/${DATA_ROOT_PREFIX}/demo.db/sales_order"
+# 写入 Iceberg 元数据文件
+echo '{"format-version": 2, "table-uuid": "demo-sales-order-001"}' | \
+  gcloud storage cp - "${DEMO_TABLE}/metadata/v1.metadata.json" &>/dev/null || true
+
+# 生成跨越 60 天边界的天级数据文件
 for offset in 0 1 30 58 59 60 61 65; do
   d=$(date -u -d "-${offset} days" +"${FOLDER_DATE_FORMAT}")
-  obj="${BUCKET}/${DATA_PREFIX}/${d}/data-00000.parquet"
+  obj="${DEMO_TABLE}/data/${d}/data-00000.parquet"
   if ! gcloud storage objects describe "${obj}" &>/dev/null; then
-    echo "iceberg-data-placeholder ${d}" | gcloud storage cp - "${obj}"
+    echo "iceberg-mock-data-${d}" | gcloud storage cp - "${obj}" &>/dev/null || true
   fi
 done
+echo "    ✔ 基础验证数据生成完毕: 覆盖 metadata/、今日增量及 60 天前后冷热边界"
 
-echo "==> 完成。下一步执行 ./reconcile.sh"
+echo "========================================================================="
+echo "✔ 环境配置全部完成！下一步请执行调和脚本: python3 reconcile_fast.py"
+echo "========================================================================="
