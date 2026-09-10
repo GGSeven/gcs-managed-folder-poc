@@ -159,7 +159,7 @@ gs://fr-xjsy-bigdata-gcs-dev/datasets/
 > [!WARNING]
 > **安全红线 2：严禁为 `mf-reconciler` 调和账号授予数据读取权限**  
 > 自定义角色 `mfReconciler` 严格限制只包含控制面与前缀遍历权限：
-> * 允许：`storage.managedFolders.create`, `storage.managedFolders.delete`, `storage.managedFolders.get`, `storage.managedFolders.list`, `storage.managedFolders.setIamPolicy`, `storage.managedFolders.getIamPolicy`, `storage.objects.list`
+> * 允许：`storage.managedFolders.create`, `storage.managedFolders.get`, `storage.managedFolders.setIamPolicy`, `storage.objects.list`
 > * 严禁包含：`storage.objects.get`（防止自动化工具越权偷窥或违规下载业务表数据内容）。
 
 ---
