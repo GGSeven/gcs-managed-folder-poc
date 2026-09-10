@@ -1,8 +1,7 @@
 # GCS Managed Folder 热/冷数据访问隔离 POC
 
-> 🚀 **生产环境交付与部署手册见 [DEPLOYMENT_MANUAL.md](DEPLOYMENT_MANUAL.md)**。
 > 📖 **给运维部门 / 大数据运维部门的分工操作手册见 [OPERATIONS.md](OPERATIONS.md)**。
-> 使用前先修改 `config.env` 中的 `PROJECT_ID`、`REGION`、`DATA_ROOT_PREFIX`。
+> 使用前先修改 `config.env` 中的 `PROJECT_ID`、`REGION`、`DATA_PREFIX`。
 
 ## 背景与真实痛点
 

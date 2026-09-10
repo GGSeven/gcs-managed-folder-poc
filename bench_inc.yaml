@@ -1,0 +1,10 @@
+steps:
+- name: 'python:3.11-slim'
+  entrypoint: 'bash'
+  args:
+  - '-c'
+  - |
+    pip install --no-cache-dir requests
+    python -u bench_incremental.py
+options:
+  logging: CLOUD_LOGGING_ONLY
