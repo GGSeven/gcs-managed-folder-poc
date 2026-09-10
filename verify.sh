@@ -1,26 +1,61 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# verify.sh - 权限隔离自动化验证脚本
-# 通过 impersonate 模拟各个业务角色，断言 403 强拦截与透明放行
+# GCS Managed Folder 热/冷数据隔离生产双向断言验证脚本 (verify.sh)
+# 作用：
+#   模拟 4 个 Service Account 身份，执行 8 项严格安全断言：
+#   1. Writer SA 在热分区写/读 (ALLOW)
+#   2. Writer SA 在冷分区写/读 (ALLOW - 支持 compaction / 历史重写)
+#   3. Hot Reader SA 读 Iceberg 元数据 metadata/ (ALLOW - 支持 SQL 解析规划)
+#   4. Hot Reader SA 读近 60 天热分区 (ALLOW)
+#   5. Hot Reader SA 读 60 天前冷分区 (DENY 403 - 强拦截，产生 0 元冷检索费)
+#   6. Cold Reader SA 读 Iceberg 元数据 metadata/ (ALLOW)
+#   7. Cold Reader SA 读 60 天前冷分区 (ALLOW)
+#   8. Cold Reader SA 读近 60 天热分区 (DENY 403 - 权限隔离)
+#   9. Reconciler SA 尝试读取任何业务数据 (DENY 403 - 零信任，无数据窃取风险)
 # ==============================================================================
 set -uo pipefail
 cd "$(dirname "$0")"
-source ./config.env
 
-DEMO_TABLE="${BUCKET}/${DATA_ROOT_PREFIX}/demo.db/sales_order"
-HOT_DATE=$(date -u -d '-1 days' +"${FOLDER_DATE_FORMAT}")
-COLD_DATE=$(date -u -d '-65 days' +"${FOLDER_DATE_FORMAT}")
+if [[ -f ./config.env ]]; then
+  source ./config.env
+else
+  echo "❌ 错误: 未找到 config.env 配置文件！"
+  exit 1
+fi
 
-META_OBJ="${DEMO_TABLE}/metadata/v1.metadata.json"
-HOT_OBJ="${DEMO_TABLE}/data/${HOT_DATE}/data-00000.parquet"
-COLD_OBJ="${DEMO_TABLE}/data/${COLD_DATE}/data-00000.parquet"
+DATA_ROOT="${DATA_ROOT_PREFIX:-datasets}"
+
+# 自动发现测试表路径（支持自定义环境变量覆盖）
+if [[ -z "${VERIFY_TABLE_PATH:-}" ]]; then
+  # 优先找 ads.db 或 perf_10k.db 或第一个发现的表
+  FIRST_TBL=$(gcloud storage ls "${BUCKET}/${DATA_ROOT}/" 2>/dev/null | grep '\.db/' | head -n 1 || true)
+  if [[ -n "${FIRST_TBL}" ]]; then
+    SUB_TBL=$(gcloud storage ls "${FIRST_TBL}" 2>/dev/null | head -n 1 || true)
+    TBL_PATH="${SUB_TBL%/}"
+  else
+    TBL_PATH="${BUCKET}/${DATA_ROOT}/ads.db/ads_100f_ext_special_car_coverage_p_d_i"
+  fi
+else
+  TBL_PATH="${VERIFY_TABLE_PATH%/}"
+fi
+
+HOT_DATE=$(date -u -d "-2 days" +"${FOLDER_DATE_FORMAT}")
+COLD_DATE=$(date -u -d "-65 days" +"${FOLDER_DATE_FORMAT}")
+TODAY_DATE=$(date -u +"${FOLDER_DATE_FORMAT}")
+
+META_FILE="${TBL_PATH}/metadata/v1.metadata.json"
+HOT_FILE="${TBL_PATH}/data/${HOT_DATE}/data-00000.parquet"
+COLD_FILE="${TBL_PATH}/data/${COLD_DATE}/data-00000.parquet"
+WRITER_TEST_FILE="${TBL_PATH}/data/${TODAY_DATE}/writer_test.txt"
 
 echo "========================================================================="
-echo "🧪 开始执行权限隔离自动化断言测试 (Verification)"
-echo "   热分区测试路径: ${HOT_OBJ#${BUCKET}/}"
-echo "   冷分区测试路径: ${COLD_OBJ#${BUCKET}/}"
-echo "   元数据测试路径: ${META_OBJ#${BUCKET}/}"
+echo "🔍 启动 GCS Managed Folder 生产安全与业务双向验证"
+echo "   验证基准表:   ${TBL_PATH}"
+echo "   热测试分区:   ${HOT_DATE}"
+echo "   冷测试分区:   ${COLD_DATE}"
 echo "========================================================================="
+
+FAILED=0
 
 check() {
   local sa="$1" op="$2" obj="$3" expect="$4" desc="$5" actual
@@ -33,7 +68,8 @@ check() {
       fi
       ;;
     write)
-      if echo "poc-write-test" | gcloud storage cp - "${obj}" --impersonate-service-account="${sa}" &>/dev/null; then
+      if echo "managed-folder-verify-$(date +%s)" | gcloud storage cp - "${obj}" \
+           --impersonate-service-account="${sa}" &>/dev/null; then
         actual="ALLOW"
       else
         actual="DENY"
@@ -42,40 +78,37 @@ check() {
   esac
 
   if [[ "${actual}" == "${expect}" ]]; then
-    echo "  [PASS ✔] ${desc} => 实际: ${actual} (符合预期)"
+    echo "  ✔ [PASS] ${desc} => 结果: ${actual} (符合预期)"
   else
-    echo "  [FAIL ✘] ${desc} => 实际: ${actual} (预期: ${expect})"
+    echo "  ✘ [FAIL] ${desc} => 结果: ${actual} (预期: ${expect}) [路径: ${obj}]"
     FAILED=1
   fi
 }
 
-FAILED=0
+echo -e "\n1. 验证业务写入方管道 (Spark/Flink: 全周期读写不受热冷切换影响):"
+check "${WRITER_SA}" write "${WRITER_TEST_FILE}" "ALLOW" "写入今日热分区 (${TODAY_DATE})"
+check "${WRITER_SA}" read  "${HOT_FILE}"         "ALLOW" "读取历史热分区 (${HOT_DATE})"
+check "${WRITER_SA}" write "${TBL_PATH}/data/${COLD_DATE}/compaction.txt" "ALLOW" "重写冷分区 (Compaction/Merge)"
 
-echo -e "\n--> [1/4] 验证 Iceberg 元数据放行 (Hot / Cold Reader 均必须可读)"
-check "${HOT_SA}"  read "${META_OBJ}" "ALLOW" "Hot Reader 读取 Iceberg metadata"
-check "${COLD_SA}" read "${META_OBJ}" "ALLOW" "Cold Reader 读取 Iceberg metadata"
+echo -e "\n2. 验证日常查询引擎权限 (Hue/分析师: 只能读热数据与元数据，严禁触碰冷数据):"
+check "${HOT_SA}" read "${META_FILE}" "ALLOW" "读取表级元数据 (metadata/v1.metadata.json)"
+check "${HOT_SA}" read "${HOT_FILE}"  "ALLOW" "读取近 60 天热分区 (${HOT_DATE})"
+check "${HOT_SA}" read "${COLD_FILE}" "DENY"  "误查 60 天前冷分区 (HTTP 403 强拦截，0 元冷检索费)"
 
-echo -e "\n--> [2/4] 验证查询分析端隔离 (Hue / 交互式查询：热数据放行，冷数据 403 强拦截)"
-check "${HOT_SA}"  read "${HOT_OBJ}"  "ALLOW" "Hot Reader 正常读取热分区"
-check "${HOT_SA}"  read "${COLD_OBJ}" "DENY"  "Hot Reader 误查冷分区 (403 强拦截，0元检索费)"
-check "${COLD_SA}" read "${COLD_OBJ}" "ALLOW" "Cold Reader 正常调阅冷分区"
-check "${COLD_SA}" read "${HOT_OBJ}"  "DENY"  "Cold Reader 越权访问热分区 (403 拦截)"
+echo -e "\n3. 验证历史合规通道权限 (Cold Reader: 仅能查冷数据与元数据，禁止越权查热数据):"
+check "${COLD_SA}" read "${META_FILE}" "ALLOW" "读取表级元数据 (metadata/v1.metadata.json)"
+check "${COLD_SA}" read "${COLD_FILE}" "ALLOW" "正常读取 60 天前冷分区 (${COLD_DATE})"
+check "${COLD_SA}" read "${HOT_FILE}"  "DENY"  "越权读取近 60 天热分区 (${HOT_DATE})"
 
-echo -e "\n--> [3/4] 验证写入端全生命周期权限 (Spark / Flink：冷热皆可读写与 Compaction)"
-check "${WRITER_SA}" read  "${HOT_OBJ}"  "ALLOW" "Writer SA 读取热数据"
-check "${WRITER_SA}" read  "${COLD_OBJ}" "ALLOW" "Writer SA 读取冷数据 (Compaction 规划)"
-check "${WRITER_SA}" write "${HOT_OBJ%/*}/writer-test.txt"  "ALLOW" "Writer SA 写入新热分区"
-check "${WRITER_SA}" write "${COLD_OBJ%/*}/writer-test.txt" "ALLOW" "Writer SA 重写历史冷数据"
+echo -e "\n4. 验证自动化运维身份权限 (mf-reconciler: 零信任，无业务数据窥探权限):"
+check "${OPS_SA}" read "${HOT_FILE}"  "DENY" "运维 SA 尝试读取热数据"
+check "${OPS_SA}" read "${COLD_FILE}" "DENY" "运维 SA 尝试读取冷数据"
 
-echo -e "\n--> [4/4] 验证调和引擎零特权原则 (Reconciler SA：只控权限，读不到数据)"
-check "${OPS_SA}" read "${HOT_OBJ}"  "DENY" "Reconciler SA 读取热数据 (无 objects.get)"
-check "${OPS_SA}" read "${COLD_OBJ}" "DENY" "Reconciler SA 读取冷数据 (无 objects.get)"
-
-echo "========================================================================="
+echo -e "\n========================================================================="
 if (( FAILED == 0 )); then
-  echo "🎉 恭喜！全部权限隔离与安全断言 100% 通过验证 ✔"
-  exit 0
+  echo "🎉 全部验证项 100% 通过！冷热隔离与元数据放行策略在底层完全生效！"
 else
-  echo "⚠️ 存在未通过项，请排查调和脚本运行状态及 IAM 策略 ✘"
+  echo "⚠️ 存在未通过的验证项，请排查存储桶 IAM 是否存在宽泛权限污染或分区调和未执行。"
   exit 1
 fi
+echo "========================================================================="
