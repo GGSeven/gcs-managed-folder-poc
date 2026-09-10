@@ -1,8 +1,9 @@
 # GCS Managed Folder 热/冷数据分层与权限隔离方案：生产交付与部署手册
 
 > **文档适用对象**：客户大数据平台架构师、SRE/DevOps 运维工程师、云安全管理员  
-> **方案版本**：v2.0 (High-Performance REST Reconcile Engine)  
+> **方案版本**：v2.1 (Dual-Mode Incremental Sliding-Window & Zero-Trust Reconcile Engine)  
 > **服务商**：Baidaodata 解决方案架构团队  
+> **Git 仓库**：https://github.com/GGSeven/gcs-managed-folder-poc.git  
 
 ---
 
@@ -14,7 +15,7 @@
 1. **0 元误查保底拦截**：分析人员或日常查询任务若误触 60 天前的历史冷数据，在 GCS 存储底层直接抛出 **`HTTP 403 Forbidden`** 强拦截，**冷数据检索量为 0，检索费用为 0**。
 2. **读写管道完全解耦**：Spark / Flink 等写入引擎具备全库、全表、全生命周期读写权限，不受热冷流转状态影响。
 3. **Iceberg 元数据透明放行**：查询引擎必须能够随时读取 Iceberg 的 `metadata/*.json`，以正确规划快照和推断分区，无论数据分区是否冷冻。
-4. **极速自动化调和**：基于 Cloud Run Job Serverless 架构，内网多线程调和引擎在 **10,000+ 分区**场景下，调和耗时仅需 **68 秒**（吞吐率达 **147.5 分区/秒**），每日定时自动滚动。
+4. **秒级增量自动化调和**：基于 Cloud Run Job Serverless 架构，采用**增量滑动窗口机制**，54 张表日度调和仅需 **2.36 秒**（全量 10,041 个分区调和仅需 **68 秒**），每日定时自动滚动。
 5. **绝对数据安全（零特权原则）**：调和引擎仅具备 GCS 控制面管理权限，**无任何数据读取权限（无 `storage.objects.get`）**，杜绝运维工具窃取业务数据的合规风险。
 
 ---
@@ -31,7 +32,7 @@ gs://<BUCKET>/<DATA_ROOT_PREFIX>/
   │         └── data/
   │              ├── dt=2026-09-10/ (近60天热数据)  <-- 天级 Managed Folder (仅绑定 Hot Reader)
   │              │    └── data-00000.parquet
-  │              └── dt=2026-04-12/ (60天前冷数据)  <-- 天级 Managed Folder (仅绑定 Cold Reader)
+  │              └── dt=2026-07-12/ (60天前冷数据)  <-- 天级 Managed Folder (仅绑定 Cold Reader)
   │                   └── data-00000.parquet
 ```
 
@@ -46,12 +47,58 @@ gs://<BUCKET>/<DATA_ROOT_PREFIX>/
 
 ---
 
-## 3. 前置准备与环境检查
+## 3. 架构师自测验证方案（Pre-flight Self-Verification）
 
-客户在执行部署前，请确保满足以下条件：
+> 在正式向客户交付前，架构师可按照以下步骤在测试环境完整执行自检与数据断言。
 
-1. **项目权限**：当前部署人员需要具备该 GCP 项目的 `roles/owner` 或 `roles/editor` + `roles/iam.securityAdmin`。
-2. **启用必要的 GCP API 服务**：
+### 3.1 环境变量预设
+```bash
+export PROJECT_ID="bd-host-2026-004"
+export REGION="us-central1"
+export BUCKET_NAME="bd-host-2026-004-mf-poc"
+export BUCKET="gs://${BUCKET_NAME}"
+export DATA_ROOT_PREFIX="datasets"
+export HOT_SA="iceberg-hot-reader@${PROJECT_ID}.iam.gserviceaccount.com"
+export COLD_SA="iceberg-cold-reader@${PROJECT_ID}.iam.gserviceaccount.com"
+export WRITER_SA="iceberg-writer@${PROJECT_ID}.iam.gserviceaccount.com"
+export RECONCILER_SA="mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com"
+```
+
+### 3.2 自检执行清单
+1. **生成 10,000+ 分区模拟数据**：
+   ```bash
+   python generate_mock_partitions.py
+   ```
+2. **执行全量调和压测**：
+   ```bash
+   gcloud builds submit --config=bench.yaml --project="${PROJECT_ID}" .
+   # 验证输出指标：10,041 分区，核心耗时约 68 秒，吞吐率 > 130 分区/秒
+   ```
+3. **执行增量调和压测**：
+   ```bash
+   gcloud builds submit --config=bench_inc.yaml --project="${PROJECT_ID}" .
+   # 验证输出指标：54 张表滑动窗口 200~300 分区，耗时约 2~8 秒，吞吐率 > 100 操作/秒
+   ```
+4. **权限断言自动化校验**：
+   ```bash
+   bash verify.sh
+   # 预期断言结果：
+   # [PASS] Writer SA 写入热分区成功
+   # [PASS] Writer SA 写入冷分区成功
+   # [PASS] Hot Reader 读取 metadata/ 成功 (200)
+   # [PASS] Hot Reader 读取近 60 天热分区成功 (200)
+   # [PASS] Hot Reader 读取 60 天前冷分区强拦截 (403 Forbidden, 0 元检索费)
+   # [PASS] Cold Reader 读取 60 天前冷分区成功 (200)
+   # [PASS] Reconciler SA 尝试读取数据对象被拒绝 (403 零特权安全合规)
+   ```
+
+---
+
+## 4. 客户生产环境部署方案（Customer Deployment Guide）
+
+### 步骤一：前置环境与存储桶 UBLA 检查
+
+1. **启用必要 GCP API**：
    ```bash
    gcloud services enable \
      storage.googleapis.com \
@@ -60,29 +107,24 @@ gs://<BUCKET>/<DATA_ROOT_PREFIX>/
      artifactregistry.googleapis.com \
      cloudscheduler.googleapis.com \
      iam.googleapis.com \
-     --project="<YOUR_PROJECT_ID>"
+     --project="<CUSTOMER_PROJECT_ID>"
    ```
-3. **UBLA（统一存储桶级访问权限）硬性要求**：
-   * GCS Managed Folder 依赖统一存储桶级访问权限。必须确保目标存储桶已开启 UBLA：
-   ```bash
-   gcloud storage buckets update gs://<YOUR_BUCKET_NAME> --uniform-bucket-level-access
-   ```
+2. **开启存储桶统一访问控制（UBLA，强制要求）**：
+   * **控制台路径**：`Cloud Storage` -> 选择目标存储桶 -> `权限` 标签页 -> 将“访问权限控制”切换为 **统一 (Uniform)**。
+   * **gcloud CLI 命令**：
+     ```bash
+     gcloud storage buckets update gs://<CUSTOMER_BUCKET_NAME> --uniform-bucket-level-access
+     ```
 
 ---
 
-## 4. 完整部署交付操作步骤
+### 步骤二：创建自定义最小权限角色（`mfReconciler`）
 
-以下操作同时提供 **GCP Web 控制台界面路径** 与 **标准自动化命令**。
-
-### 步骤一：创建自定义最小权限角色（`mfReconciler`）
-
-该角色用于调度引擎，**严格遵循零信任权限原则**，剥离了数据读取权限 `storage.objects.get`。
+严格遵循零信任原则，剥离业务数据读取权限 `storage.objects.get`。
 
 * **控制台路径**：`IAM & 管理` -> `角色 (Roles)` -> `+ 创建角色`
-  * 标题：`Managed Folder Reconciler`
-  * 角色 ID：`mfReconciler`
-  * 角色发布阶段：正式版 (GA)
-  * 添加权限：
+  * 标题：`Managed Folder Reconciler`，角色 ID：`mfReconciler`
+  * 权限列表：
     - `storage.managedFolders.create`
     - `storage.managedFolders.get`
     - `storage.managedFolders.list`
@@ -93,7 +135,7 @@ gs://<BUCKET>/<DATA_ROOT_PREFIX>/
 * **gcloud CLI 命令**：
   ```bash
   gcloud iam roles create mfReconciler \
-    --project="<YOUR_PROJECT_ID>" \
+    --project="<CUSTOMER_PROJECT_ID>" \
     --title="Managed Folder Reconciler" \
     --description="Manage managed folders and list prefixes without reading data" \
     --permissions="storage.managedFolders.create,storage.managedFolders.get,storage.managedFolders.list,storage.managedFolders.getIamPolicy,storage.managedFolders.setIamPolicy,storage.objects.list,storage.buckets.get"
@@ -101,12 +143,12 @@ gs://<BUCKET>/<DATA_ROOT_PREFIX>/
 
 ---
 
-### 步骤二：创建四大专用服务账号（Service Accounts）
+### 步骤三：创建四大专用服务账号
 
 * **控制台路径**：`IAM & 管理` -> `服务账号 (Service Accounts)` -> `+ 创建服务账号`
 * **gcloud CLI 命令**：
   ```bash
-  PROJECT_ID="<YOUR_PROJECT_ID>"
+  PROJECT_ID="<CUSTOMER_PROJECT_ID>"
   for sa in "iceberg-writer" "iceberg-hot-reader" "iceberg-cold-reader" "mf-reconciler"; do
     gcloud iam service-accounts create "${sa}" \
       --project="${PROJECT_ID}" \
@@ -116,13 +158,13 @@ gs://<BUCKET>/<DATA_ROOT_PREFIX>/
 
 ---
 
-### 步骤三：初始化存储桶根级 Managed Folder 与权限注入
+### 步骤四：初始化数据根目录 Managed Folder
 
-在数据根目录（如 `gs://<YOUR_BUCKET>/datasets/`）创建根 Managed Folder，将写入方与运维方权限圈定在根目录下，杜绝权限扩散至存储桶外其他文件。
+在数据根目录（如 `gs://<BUCKET>/datasets/`）创建根 Managed Folder，圈定写入方与运维方范围。
 
 * **gcloud CLI 命令**：
   ```bash
-  BUCKET="gs://<YOUR_BUCKET_NAME>"
+  BUCKET="gs://<CUSTOMER_BUCKET_NAME>"
   DATA_PREFIX="datasets"
 
   # 1. 创建根级 Managed Folder
@@ -149,162 +191,143 @@ gs://<BUCKET>/<DATA_ROOT_PREFIX>/
 
 ---
 
-### 步骤四：创建 Artifact Registry 仓库并构建推送镜像
+### 步骤五：构建并部署 Cloud Run Job 调和引擎
 
-* **控制台路径**：`Artifact Registry` -> `代码库 (Repositories)` -> `+ 创建代码库`（格式: Docker，区域: 生产所在区域，如 `us-central1`）
-* **gcloud CLI 命令**：
-  ```bash
-  REGION="<YOUR_REGION>" # 例如 us-central1
-  REPO_NAME="mf-poc"
-  IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/reconcile-fast:latest"
+1. **创建 Artifact Registry 仓库并构建镜像**：
+   ```bash
+   REGION="<CUSTOMER_REGION>" # 例如 us-central1
+   REPO_NAME="mf-reconciler"
+   IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/reconcile-fast:latest"
 
-  # 1. 创建 Docker 仓库（若不存在）
-  gcloud artifacts repositories create "${REPO_NAME}" \
-    --repository-format=docker \
-    --location="${REGION}" \
-    --project="${PROJECT_ID}" || true
+   gcloud artifacts repositories create "${REPO_NAME}" \
+     --repository-format=docker \
+     --location="${REGION}" \
+     --project="${PROJECT_ID}" || true
 
-  # 2. 使用 Cloud Build 自动构建镜像
-  gcloud builds submit --tag "${IMAGE}" --project="${PROJECT_ID}" .
-  ```
+   gcloud builds submit --tag "${IMAGE}" --project="${PROJECT_ID}" .
+   ```
 
----
-
-### 步骤五：部署 Cloud Run Job（计算型调和引擎）
-
-* **控制台路径**：`Cloud Run` -> `任务 (Jobs)` -> `+ 创建任务 (Create Job)`
-  * 容器映像网址：`${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/reconcile-fast:latest`
-  * 区域：与 GCS 存储桶同区域（同机房内网延迟 <1ms）
-  * 资源规格：2 vCPU / 1 GiB 内存
-  * 任务超时：1 小时，最大重试次数：1
-  * 服务账号：选择 `mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com`
-  * 环境变量（Environment Variables）：
-    * `PROJECT_ID`: `<YOUR_PROJECT_ID>`
-    * `REGION`: `<YOUR_REGION>`
-    * `BUCKET`: `gs://<YOUR_BUCKET_NAME>`
-    * `DATA_ROOT_PREFIX`: `datasets`
-    * `HOT_DAYS`: `60`
-    * `HOT_SA`: `iceberg-hot-reader@${PROJECT_ID}.iam.gserviceaccount.com`
-    * `COLD_SA`: `iceberg-cold-reader@${PROJECT_ID}.iam.gserviceaccount.com`
-    * `MAX_WORKERS`: `30`
-    * `EXCLUDE_DBS`: `tmp.db,kafka_test.db`
-* **gcloud CLI 命令**：
-  ```bash
-  gcloud run jobs deploy mf-reconcile \
-    --image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/reconcile-fast:latest" \
-    --region="${REGION}" \
-    --project="${PROJECT_ID}" \
-    --service-account="mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com" \
-    --cpu=2 \
-    --memory=1Gi \
-    --max-retries=1 \
-    --task-timeout=1h \
-    --set-env-vars="PROJECT_ID=${PROJECT_ID},REGION=${REGION},BUCKET=${BUCKET},DATA_ROOT_PREFIX=datasets,HOT_DAYS=60,HOT_SA=iceberg-hot-reader@${PROJECT_ID}.iam.gserviceaccount.com,COLD_SA=iceberg-cold-reader@${PROJECT_ID}.iam.gserviceaccount.com,MAX_WORKERS=30,EXCLUDE_DBS=tmp.db\,kafka_test.db"
-  ```
+2. **部署 Cloud Run Job（计算型）**：
+   * **控制台路径**：`Cloud Run` -> `任务 (Jobs)` -> `+ 创建任务 (Create Job)`
+     * 容器映像：`${IMAGE}`
+     * 区域：与 GCS 存储桶保持同一 Region
+     * 规格：2 vCPU / 1 GiB 内存
+     * 服务账号：`mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com`
+     * 超时：10 分钟，最大重试次数：0
+     * 环境变量配置：
+       - `PROJECT_ID`: `<CUSTOMER_PROJECT_ID>`
+       - `REGION`: `<CUSTOMER_REGION>`
+       - `BUCKET`: `gs://<CUSTOMER_BUCKET_NAME>`
+       - `DATA_ROOT_PREFIX`: `datasets`
+       - `HOT_DAYS`: `60`
+       - `RECONCILE_MODE`: `incremental` (生产默认增量模式)
+       - `SLIDING_LOOKBACK_DAYS`: `3`
+       - `MAX_WORKERS`: `30`
+       - `EXCLUDE_DBS`: `tmp.db,kafka_test.db`
+   * **gcloud CLI 命令**：
+     ```bash
+     gcloud run jobs deploy mf-reconcile \
+       --image="${IMAGE}" \
+       --region="${REGION}" \
+       --project="${PROJECT_ID}" \
+       --service-account="mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --cpu=2 \
+       --memory=1Gi \
+       --max-retries=0 \
+       --task-timeout=10m \
+       --env-vars-file="env_vars.yaml"
+     ```
 
 ---
 
-### 步骤六：配置 Cloud Scheduler 每日定时触发
+### 步骤六：配置双模自动调度策略（Cloud Scheduler）
 
-* **控制台路径**：`Cloud Scheduler` -> `创建作业`
-  * 名称：`mf-reconcile-daily`
-  * 频率：`30 0 * * *`（每天凌晨 00:30 UTC / 对应北京时间 08:30）
-  * 目标类型：`HTTP`
-  * 网址：`https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/mf-reconcile:run`
-  * HTTP 方法：`POST`
-  * Auth 标头：`添加 OAuth 令牌`
-  * 服务账号：选择具备 `roles/run.invoker` 权限的服务账号
-* **gcloud CLI 命令**：
-  ```bash
-  # 授予 reconciler 触发自身调度的权限（或使用调度专用 SA）
-  gcloud run jobs add-iam-policy-binding mf-reconcile \
-    --region="${REGION}" \
-    --project="${PROJECT_ID}" \
-    --member="serviceAccount:mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com" \
-    --role="roles/run.invoker"
+1. **每日增量调和任务（默认高频，执行约 2~3 秒）**：
+   * **控制台路径**：`Cloud Scheduler` -> `创建作业`
+     * 名称：`mf-reconcile-daily`
+     * 频率：`05 0 * * *`（每天凌晨 00:05 UTC / 北京时间 08:05）
+     * 目标：`HTTP`，方法：`POST`
+     * 网址：`https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/mf-reconcile:run`
+     * Auth 标头：`添加 OAuth 令牌`，服务账号：`mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com`
+   * **CLI 命令**：
+     ```bash
+     gcloud run jobs add-iam-policy-binding mf-reconcile \
+       --region="${REGION}" \
+       --project="${PROJECT_ID}" \
+       --member="serviceAccount:mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --role="roles/run.invoker"
 
-  # 创建每日定时触发任务
-  gcloud scheduler jobs create http mf-reconcile-daily \
-    --location="${REGION}" \
-    --project="${PROJECT_ID}" \
-    --schedule="30 0 * * *" \
-    --time-zone="Etc/UTC" \
-    --uri="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/mf-reconcile:run" \
-    --http-method=POST \
-    --oauth-service-account-email="mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com"
-  ```
+     gcloud scheduler jobs create http mf-reconcile-daily \
+       --location="${REGION}" \
+       --project="${PROJECT_ID}" \
+       --schedule="05 0 * * *" \
+       --time-zone="Etc/UTC" \
+       --uri="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/mf-reconcile:run" \
+       --http-method=POST \
+       --oauth-service-account-email="mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com"
+     ```
 
----
-
-## 5. 验收与权限验证方案
-
-部署完成后，在客户端机器（拥有 `roles/iam.serviceAccountTokenCreator` 权限以进行 impersonation 模拟）运行以下验证命令：
-
-### 5.1 验证日常热查询（模拟 Hue / 分析师）
-```bash
-HOT_SA="iceberg-hot-reader@${PROJECT_ID}.iam.gserviceaccount.com"
-
-# 1. 验证元数据读取：预期 HTTP 200 (ALLOW)
-gcloud storage cat gs://${BUCKET_NAME}/datasets/<db>.db/<tbl>/metadata/v1.metadata.json \
-  --impersonate-service-account="${HOT_SA}"
-
-# 2. 验证近 60 天热分区读取：预期 HTTP 200 (ALLOW)
-gcloud storage cat gs://${BUCKET_NAME}/datasets/<db>.db/<tbl>/data/dt=2026-09-08/data-00000.parquet \
-  --impersonate-service-account="${HOT_SA}"
-
-# 3. 验证误查 60 天前冷分区读取：预期 HTTP 403 Forbidden (DENY，0 元检索费)
-gcloud storage cat gs://${BUCKET_NAME}/datasets/<db>.db/<tbl>/data/dt=2026-04-12/data-00000.parquet \
-  --impersonate-service-account="${HOT_SA}"
-```
-
-### 5.2 验证写入方读写自由（模拟 Spark / Flink）
-```bash
-WRITER_SA="iceberg-writer@${PROJECT_ID}.iam.gserviceaccount.com"
-
-# 1. 写入热分区：预期 ALLOW
-echo "test" | gcloud storage cp - gs://${BUCKET_NAME}/datasets/<db>.db/<tbl>/data/dt=2026-09-08/test.txt \
-  --impersonate-service-account="${WRITER_SA}"
-
-# 2. 重写历史冷分区（Compaction 场景）：预期 ALLOW
-echo "test" | gcloud storage cp - gs://${BUCKET_NAME}/datasets/<db>.db/<tbl>/data/dt=2026-04-12/test.txt \
-  --impersonate-service-account="${WRITER_SA}"
-```
+2. **周度全量巡检兜底任务（每周日执行一次，全库审计）**：
+   ```bash
+   gcloud scheduler jobs create http mf-reconcile-weekly-full \
+     --location="${REGION}" \
+     --project="${PROJECT_ID}" \
+     --schedule="00 1 * * 0" \
+     --time-zone="Etc/UTC" \
+     --uri="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/mf-reconcile:run" \
+     --http-method=POST \
+     --message-body='{"overrides":{"containerOverrides":[{"env":[{"name":"RECONCILE_MODE","value":"full"}]}]}}' \
+     --oauth-service-account-email="mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com"
+   ```
 
 ---
 
-## 6. 架构师前瞻性风险与运维避坑指南
+## 5. 客户侧验收测试用例与标准（Acceptance Criteria）
 
-### ⚠️ 陷阱一：Bucket 级 / Project 级权限污染（Additive IAM 叠加风险）
-* **风险表现**：GCS Managed Folder 的 IAM 鉴权为**纯叠加（Additive）模式**，不支持显式 Deny。如果用户或 SA 在**Bucket 级别**或**Project 级别**被授予了 `roles/storage.objectViewer`，该权限会自动穿透所有 Managed Folder，导致冷数据隔离完全失效！
-* **防范方案**：审计脚本必须确保 `iceberg-hot-reader` 在 Bucket 级没有任何 `storage.objects.*` 绑定，其权限只能逐层下发到 Managed Folder 上。
-
-### ⚠️ 陷阱二：跨日作业写入阻断（Midnight Write Window Gap）
-* **风险表现**：如果定时任务在每天 00:30 执行，而 Spark/Flink 在 00:01 开始写入今天新分区 `dt=TODAY`，此时如果该目录尚未打上 Managed Folder 标签，写入是否会受阻？
-* **防范方案**：
-  1. 本调和引擎具备**预创建机制**：每次运行都会自动为全量表预创建并绑定今天（`offset=0`）与明天（`offset=1`）两个分区。
-  2. 即使未预创建，由于 `iceberg-writer` 在根目录 `datasets/` 上已持有 `roles/storage.objectUser`，具备向任意新子路径写入对象的权限。
-
-### ⚠️ 陷阱三：命令行工具与 SDK 鉴权陷阱（CLI objects.get 403）
-* **风险表现**：在纯容器中若调用 `gcloud storage managed-folders set-iam-policy`，CLI 会额外发起 `objects.get` 检查目录对象是否存在。若运维 SA 采用最小权限，CLI 会抛出 403。
-* **防范方案**：交付镜像必须锁定为本方案提供的 Python 原生 REST 引擎（`reconcile-fast`），直接对接 GCS 控制面 API，规避 CLI 的非必要探测。
-
-### ⚠️ 陷阱四：大规模分区 QPS 限流与网络优化
-* **指标数据**：万级分区在跨公网调用时极易发生 Winsock 10053 重置或耗时过长；而在 Cloud Run 与 GCS 同一区域（`us-central1`）内网调用时，单核吞吐可达 **140~150 分区/秒**。
-* **最佳实践**：
-  * Cloud Run Job 必须与 GCS 部署在**同一 GCP Region**。
-  * 并发线程建议设为 `20 ~ 30`。避免超过 50，以符合 GCP GCS 控制面单个资源建议的并发速率阈值。
+| 用例编号 | 测试场景 | 测试操作（使用 impersonation 模拟） | 预期结果 |
+| :--- | :--- | :--- | :--- |
+| **TC-01** | **写入管道不受限** | 使用 `iceberg-writer` 向任意热/冷分区写入测试文件 | **成功写入 (HTTP 200)** |
+| **TC-02** | **元数据常开** | 使用 `iceberg-hot-reader` 读取某表 `metadata/*.json` | **成功读取 (HTTP 200)** |
+| **TC-03** | **日常近60天热查询** | 使用 `iceberg-hot-reader` 读取 `dt=TODAY` 分区文件 | **成功读取 (HTTP 200)** |
+| **TC-04** | **误查 60 天冷数据拦截** | 使用 `iceberg-hot-reader` 读取 60 天前冷分区文件 | **抛出 403 Forbidden，检索费为 0** |
+| **TC-05** | **审计专用冷通道** | 使用 `iceberg-cold-reader` 读取 60 天前冷分区文件 | **成功读取 (HTTP 200)** |
+| **TC-06** | **调和引擎零特权** | 使用 `mf-reconciler` 尝试直接读取任意业务数据 | **抛出 403 Forbidden（无数据访问权）** |
+| **TC-07** | **增量性能验收** | 触发 Cloud Run 增量任务执行 | **耗时 < 10 秒，100% 成功退出** |
 
 ---
 
-## 7. 客户实施前调研清单（Customer Discovery Questions）
+## 6. 架构师前瞻性风险与运维避坑指南 (Architect Proactivity)
 
-在客户实施前，架构师请与客户确认以下关键要素：
+### ⚠️ 风险 1：存储桶或项目级权限穿透（Additive IAM 叠加陷阱）
+* **风险描述**：GCS Managed Folder 是纯累加鉴权机制，不支持 Deny 策略。若客户管理员误将 `roles/storage.objectViewer` 赋予在 **Bucket 级别** 或 **Project 级别**，该权限会自动穿透至所有底层分区，冷数据 403 强拦截将直接失效！
+* **缓解方案**：
+  1. 交付验收时运行审计脚本，确保 Bucket 级 IAM 列表中不存在 `iceberg-hot-reader`。
+  2. 在客户组织策略（Organization Policy）中配置 IAM 最小授权审查，或使用 Cloud Asset Inventory 设置 Bucket 级越权告警。
 
-1. **现有数仓目录与分区命名规则**：
-   * 是否全量表均严格遵循 `datasets/<db>.db/<table_name>/data/dt=YYYY-MM-DD/` 规范？是否有二级分区（如 `dt=YYYY-MM-DD/hh=XX/`）？
-2. **读写管道身份对接**：
-   * 目前生产集群的 Spark/Flink 任务是以何种凭据（Service Account Key、Workload Identity、还是 Compute Engine 默认 SA）挂载访问 GCS 的？
-   * Hue / Trino / Impala 集群查询引擎是以何种凭据代理用户访问 GCS 的？
-3. **冷热阈值与数据保留周期**：
-   * 业务侧要求的冷热分界线是否统一为 60 天？是否有部分特殊报表表需要保留 90 天或 180 天？
-   * 是否已在 GCS Bucket 上配置匹配的 GCS Lifecycle 规则（例如 60 天转 Coldline）？
+### ⚠️ 风险 2：跨零点 ETL 写入延迟与目录预热（Midnight Gap）
+* **风险描述**：若 Spark/Flink 在 00:01 开始写入今天新分区，而调度调和任务在 00:05 执行，这 4 分钟内新分区尚未配置 Managed Folder，写入是否报错？
+* **缓解方案**：
+  1. 引擎内置**T+1 预建机制**：前一天调和时已提前将明天的 Managed Folder 预建并授权。
+  2. 写入方 `iceberg-writer` 在根目录 `datasets/` 上具备 `roles/storage.objectUser`，即便子目录尚未创建 Managed Folder，写入管道也拥有继承权，绝不会阻断 ETL 生产管道。
+
+### ⚠️ 风险 3：大规模分区 QPS 限流与网络延迟
+* **风险描述**：跨地域或公网调用 GCS 控制面 API 会产生 200ms+ RTT 延迟且极易受网络波动影响。
+* **缓解方案**：
+  1. Cloud Run Job 必须部署在与 GCS 存储桶相同的 Region（同可用区/机房内网调用延迟 < 1ms）。
+  2. 引擎内部设置最大并发为 30，既达到 140+ 分区/秒的高吞吐，又安全处于 GCP GCS 控制面 QPS 配额范围内。
+
+---
+
+## 7. 客户实施前调研清单 (Customer Discovery Questions)
+
+在向客户正式推行本方案前，请务必与客户技术负责人澄清以下事项：
+
+1. **目录规范一致性**：
+   - 生产环境中各库表是否严格遵循 `datasets/<db>.db/<tbl>/data/dt=YYYY-MM-DD/`？
+   - 是否存在二级分区（如 `dt=.../hour=...`）？若有，Managed Folder 仅需挂载在天级 `dt=.../` 即可。
+2. **计算引擎凭据身份对接**：
+   - 写入管道（Spark/Flink）目前是通过 Workload Identity 还是 SA 静态密钥访问 GCS？
+   - 查询引擎（Hue/Trino/Impala）是以固定 Service Account 访问 GCS，还是开启了用户身份模拟（Impersonation）？
+3. **冷热转换与生命周期规则对齐**：
+   - 业务部门认定的冷数据分水岭是否统一为 60 天？是否有某些核心维度表要求 180 天或永久为热？
+   - 存储桶现有的 GCS Lifecycle 规则是否已配置为 60 天转换到 Coldline 存储类？（必须确保 IAM 隔离周期与存储转冷周期严格对齐）。
