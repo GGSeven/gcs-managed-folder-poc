@@ -1,33 +1,25 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # GCS Managed Folder 热/冷数据隔离生产双向断言验证脚本 (verify.sh)
-# 作用：
-#   模拟 4 个 Service Account 身份，执行 8 项严格安全断言：
-#   1. Writer SA 在热分区写/读 (ALLOW)
-#   2. Writer SA 在冷分区写/读 (ALLOW - 支持 compaction / 历史重写)
-#   3. Hot Reader SA 读 Iceberg 元数据 metadata/ (ALLOW - 支持 SQL 解析规划)
-#   4. Hot Reader SA 读近 60 天热分区 (ALLOW)
-#   5. Hot Reader SA 读 60 天前冷分区 (DENY 403 - 强拦截，产生 0 元冷检索费)
-#   6. Cold Reader SA 读 Iceberg 元数据 metadata/ (ALLOW)
-#   7. Cold Reader SA 读 60 天前冷分区 (ALLOW)
-#   8. Cold Reader SA 读近 60 天热分区 (DENY 403 - 权限隔离)
-#   9. Reconciler SA 尝试读取任何业务数据 (DENY 403 - 零信任，无数据窃取风险)
 # ==============================================================================
 set -uo pipefail
-cd "$(dirname "$0")"
 
+# 1. 加载配置
 if [[ -f ./config.env ]]; then
   source ./config.env
-else
-  echo "❌ 错误: 未找到 config.env 配置文件！"
-  exit 1
 fi
 
+PROJECT_ID="${PROJECT_ID:-bd-host-2026-004}"
+BUCKET="${BUCKET:-gs://${PROJECT_ID}-mf-poc}"
 DATA_ROOT="${DATA_ROOT_PREFIX:-datasets}"
 
-# 自动发现测试表路径（支持自定义环境变量覆盖）
+HOT_SA="${HOT_SA:-iceberg-hot-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
+COLD_SA="${COLD_SA:-iceberg-cold-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
+WRITER_SA="${WRITER_SA:-iceberg-writer@${PROJECT_ID}.iam.gserviceaccount.com}"
+OPS_SA="${OPS_SA:-mf-reconciler@${PROJECT_ID}.iam.gserviceaccount.com}"
+
+# 2. 自动定位或指定验证基准表
 if [[ -z "${VERIFY_TABLE_PATH:-}" ]]; then
-  # 优先找 ads.db 或 perf_10k.db 或第一个发现的表
   FIRST_TBL=$(gcloud storage ls "${BUCKET}/${DATA_ROOT}/" 2>/dev/null | grep '\.db/' | head -n 1 || true)
   if [[ -n "${FIRST_TBL}" ]]; then
     SUB_TBL=$(gcloud storage ls "${FIRST_TBL}" 2>/dev/null | head -n 1 || true)
@@ -39,21 +31,58 @@ else
   TBL_PATH="${VERIFY_TABLE_PATH%/}"
 fi
 
-HOT_DATE=$(date -u -d "-2 days" +"${FOLDER_DATE_FORMAT}")
-COLD_DATE=$(date -u -d "-65 days" +"${FOLDER_DATE_FORMAT}")
-TODAY_DATE=$(date -u +"${FOLDER_DATE_FORMAT}")
+# 3. 动态扫描该表实际存在的分区，精准匹配真实热分区 (<60天) 和真实冷分区 (>60天)
+NOW_EPOCH=$(date +%s)
+HOT_PART=""
+COLD_PART=""
+HOT_DATE=""
+COLD_DATE=""
+
+EXISTING_PARTS=$(gcloud storage ls "${TBL_PATH}/data/" 2>/dev/null | grep 'dt=' || true)
+
+for p in ${EXISTING_PARTS}; do
+  p_clean="${p%/}"
+  part_name="${p_clean##*/}"
+  dt_str="${part_name#dt=}"
+  p_epoch=$(date -d "${dt_str}" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "${dt_str}" +%s 2>/dev/null || true)
+  if [[ -n "${p_epoch}" ]]; then
+    diff_days=$(( (NOW_EPOCH - p_epoch) / 86400 ))
+    if (( diff_days >= 0 && diff_days < 60 )) && [[ -z "${HOT_PART}" ]]; then
+      HOT_PART="${p_clean}"
+      HOT_DATE="${part_name}"
+    elif (( diff_days >= 60 )) && [[ -z "${COLD_PART}" ]]; then
+      COLD_PART="${p_clean}"
+      COLD_DATE="${part_name}"
+    fi
+  fi
+  if [[ -n "${HOT_PART}" && -n "${COLD_PART}" ]]; then
+    break
+  fi
+done
+
+# 兜底默认值
+HOT_PART="${HOT_PART:-${TBL_PATH}/data/$(date -u +"dt=%Y-%m-%d")}"
+HOT_DATE="${HOT_DATE:-$(date -u +"dt=%Y-%m-%d")}"
+COLD_PART="${COLD_PART:-${TBL_PATH}/data/$(date -u -d "-65 days" +"dt=%Y-%m-%d")}"
+COLD_DATE="${COLD_DATE:-$(date -u -d "-65 days" +"dt=%Y-%m-%d")}"
 
 META_FILE="${TBL_PATH}/metadata/v1.metadata.json"
-HOT_FILE="${TBL_PATH}/data/${HOT_DATE}/data-00000.parquet"
-COLD_FILE="${TBL_PATH}/data/${COLD_DATE}/data-00000.parquet"
-WRITER_TEST_FILE="${TBL_PATH}/data/${TODAY_DATE}/writer_test.txt"
+HOT_FILE="${HOT_PART}/test_verify_data.parquet"
+COLD_FILE="${COLD_PART}/test_verify_data.parquet"
+WRITER_TEST_FILE="${HOT_PART}/writer_test.txt"
 
 echo "========================================================================="
 echo "🔍 启动 GCS Managed Folder 生产安全与业务双向验证"
-echo "   验证基准表:   ${TBL_PATH}"
-echo "   热测试分区:   ${HOT_DATE}"
-echo "   冷测试分区:   ${COLD_DATE}"
+echo "   基准验证表:   ${TBL_PATH}"
+echo "   真实热测试分区: ${HOT_DATE}"
+echo "   真实冷测试分区: ${COLD_DATE}"
 echo "========================================================================="
+
+# 4. 前置准备：由业务写入方 (iceberg-writer) 写入测试实体文件（确保测试真实权限而非404）
+echo "--> [准备] 正在通过 iceberg-writer 写入测试断言实体文件..."
+echo "{\"table\":\"test\",\"version\":1}" | gcloud storage cp - "${META_FILE}" --impersonate-service-account="${WRITER_SA}" &>/dev/null || true
+echo "mock-hot-data" | gcloud storage cp - "${HOT_FILE}" --impersonate-service-account="${WRITER_SA}" &>/dev/null || true
+echo "mock-cold-data" | gcloud storage cp - "${COLD_FILE}" --impersonate-service-account="${WRITER_SA}" &>/dev/null || true
 
 FAILED=0
 
@@ -78,7 +107,7 @@ check() {
   esac
 
   if [[ "${actual}" == "${expect}" ]]; then
-    echo "  ✔ [PASS] ${desc} => 结果: ${actual} (符合预期)"
+    echo "  ✔ [PASS] ${desc} => 结果: ${actual}"
   else
     echo "  ✘ [FAIL] ${desc} => 结果: ${actual} (预期: ${expect}) [路径: ${obj}]"
     FAILED=1
@@ -86,9 +115,9 @@ check() {
 }
 
 echo -e "\n1. 验证业务写入方管道 (Spark/Flink: 全周期读写不受热冷切换影响):"
-check "${WRITER_SA}" write "${WRITER_TEST_FILE}" "ALLOW" "写入今日热分区 (${TODAY_DATE})"
+check "${WRITER_SA}" write "${WRITER_TEST_FILE}" "ALLOW" "写入今日热分区 (${HOT_DATE})"
 check "${WRITER_SA}" read  "${HOT_FILE}"         "ALLOW" "读取历史热分区 (${HOT_DATE})"
-check "${WRITER_SA}" write "${TBL_PATH}/data/${COLD_DATE}/compaction.txt" "ALLOW" "重写冷分区 (Compaction/Merge)"
+check "${WRITER_SA}" write "${COLD_PART}/compaction.txt" "ALLOW" "重写冷分区 (Compaction/Merge)"
 
 echo -e "\n2. 验证日常查询引擎权限 (Hue/分析师: 只能读热数据与元数据，严禁触碰冷数据):"
 check "${HOT_SA}" read "${META_FILE}" "ALLOW" "读取表级元数据 (metadata/v1.metadata.json)"
