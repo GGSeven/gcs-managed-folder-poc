@@ -64,8 +64,8 @@ def get_access_token():
     if env_token:
         return env_token.strip()
 
-    # 1. 优先尝试从 Cloud Run 元数据服务器获取（仅在容器或明确 GCP 环境）
-    if os.environ.get("K_SERVICE") or os.environ.get("CLOUD_RUN_JOB"):
+    # 1. 优先尝试从元数据服务器获取（容器/GCP Linux 环境）
+    if sys.platform != "win32" or os.environ.get("K_SERVICE") or os.environ.get("CLOUD_RUN_JOB"):
         try:
             r = requests.get(
                 "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
