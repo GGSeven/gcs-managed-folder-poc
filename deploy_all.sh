@@ -2,11 +2,11 @@
 # ==============================================================================
 # GCS Managed Folder 客户生产一键全自动部署脚本 (deploy_all.sh)
 # 作用：
-#   1. 幂等检查并自动补齐 UBLA 与 IAM 前置权限（防止客户漏配）
-#   2. 内嵌高性能调和引擎源码，无需额外下载或依赖 .env 配置文件
+#   1. 幂等检查并自动补齐 UBLA 与 IAM 前置权限（防止漏配）
+#   2. 内嵌高性能调和引擎源码（全量+增量双模），无需额外依赖 .env 配置文件
 #   3. 临时构建隔离，秒级 Cloud Build 构建推送轻量容器镜像
-#   4. 部署/更新 Cloud Run Job 与 Cloud Scheduler 定时触发
-#   5. 部署完成后自动触发一次云端试运行，验证全链路联通性
+#   4. 部署/平滑更新 Cloud Run Job 与 Cloud Scheduler 每日增量定时作业
+#   5. 异步触发首次全量存量调和作业（--async，不卡终端，可后台观察日志）
 # ==============================================================================
 set -euo pipefail
 
@@ -108,7 +108,7 @@ TOP_MF="${BUCKET}/${DATA_ROOT_PREFIX}/"
 gcloud storage managed-folders create "${TOP_MF}" &>/dev/null || true
 
 POLICY_TMP=$(mktemp)
-cat > "${POLICY_TMP}" <<EOF
+cat > "${POLICY_TMP}" <<EOF_POL
 {
   "bindings": [
     {
@@ -121,7 +121,7 @@ cat > "${POLICY_TMP}" <<EOF
     }
   ]
 }
-EOF
+EOF_POL
 gcloud storage managed-folders set-iam-policy "${TOP_MF}" "${POLICY_TMP}" &>/dev/null
 rm -f "${POLICY_TMP}"
 echo "    ✔ 顶级 Managed Folder [${TOP_MF}] 权限策略确认就绪"
@@ -147,7 +147,6 @@ fi
 BUILD_DIR=$(mktemp -d)
 trap 'rm -rf "${BUILD_DIR}"' EXIT
 
-# 写入 Dockerfile
 cat << 'EOF_DOCKER' > "${BUILD_DIR}/Dockerfile"
 FROM python:3.11-slim
 WORKDIR /app
@@ -156,7 +155,6 @@ COPY reconcile_fast.py /app/
 ENTRYPOINT ["python3", "reconcile_fast.py"]
 EOF_DOCKER
 
-# 写入核心 Python 调和引擎源码
 cat << 'EOF_PY' > "${BUILD_DIR}/reconcile_fast.py"
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -300,7 +298,7 @@ def main():
         tables = list_sub_prefixes(session, db)
         selected_tables.extend(tables)
 
-    print(f"✔ 扫描完成：共发现 {len(selected_tables)} 张业务表 (跳过黑名单库: {list(EXCLUDE_DBS) if EXCLUDE_DBS else '无'})", flush=True)
+    print(f"✔ 扫描完成：共发现 {len(selected_tables)} 张业务表", flush=True)
 
     start_par = time.time()
     success_count = 0
@@ -338,7 +336,7 @@ def main():
                     print(f"    ⏳ [增量进度] {success_count}/{total_units} ({pct:.1f}%) 已处理...", flush=True)
 
     else:
-        print(f"\n--> [阶段 2/3] 多线程并发准备 {len(selected_tables)} 张表的 metadata 与今明两日写入分区...", flush=True)
+        print(f"\n--> [阶段 2/3] 并发准备 {len(selected_tables)} 张表的 metadata 与今明两日写入分区...", flush=True)
         all_partitions = []
         tables_done = 0
 
@@ -352,7 +350,7 @@ def main():
                     print(f"    ⏳ [表扫描进度] 已扫描 {tables_done}/{len(selected_tables)} 张表 (已汇总 {len(all_partitions)} 个历史分区)...", flush=True)
 
         total_units = len(all_partitions)
-        print(f"\n--> [阶段 3/3] 收集到全量分区总计: {total_units} 个，启动 {MAX_WORKERS} 线程池并发调和...", flush=True)
+        print(f"\n--> [阶段 3/3] 收集到全量分区总计: {total_units} 个，启动 {MAX_WORKERS} 线程池并发全量调和...", flush=True)
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(process_partition_task, session, p): p for p in all_partitions}
@@ -397,7 +395,7 @@ echo "    ✔ 构建上下文已隔离，提交 Cloud Build 构建镜像 (上传
 gcloud builds submit "${BUILD_DIR}" --tag "${IMAGE}" --project="${PROJECT_ID}"
 
 # ------------------------------------------------------------------------------
-# 阶段五：部署 / 平滑更新 Cloud Run Job 与 Cloud Scheduler（幂等执行）
+# 阶段五：部署 / 平滑更新 Cloud Run Job 与 Cloud Scheduler（默认每日增量）
 # ------------------------------------------------------------------------------
 echo -e "\n==> [5/6] 部署/更新 Cloud Run Job [${JOB_NAME}] 与定时作业..."
 
@@ -416,7 +414,7 @@ SLIDING_LOOKBACK_DAYS: "3"
 EXCLUDE_DBS: "tmp.db,kafka_test.db"
 EOF_YAML
 
-# 部署或更新 Cloud Run Job
+# 部署或更新 Cloud Run Job（作业默认常驻配置为增量模式）
 gcloud run jobs deploy "${JOB_NAME}" \
   --image="${IMAGE}" \
   --region="${REGION}" \
@@ -462,14 +460,27 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# 阶段六：部署后立即触发一次云端试运行，现场验证连通性
+# 阶段六：异步触发首次全量存量调和作业（--async，不卡终端）
 # ------------------------------------------------------------------------------
-echo -e "\n==> [6/6] 触发云端执行，验证 Cloud Run Job 增量调和连通性..."
-gcloud run jobs execute "${JOB_NAME}" --region="${REGION}" --project="${PROJECT_ID}" --wait
+echo -e "\n==> [6/6] 异步调用首次【全量存量调和】任务..."
+echo "    指令: gcloud run jobs execute ${JOB_NAME} --update-env-vars=RECONCILE_MODE=full --async"
+
+EXEC_NAME=$(gcloud run jobs execute "${JOB_NAME}" \
+  --region="${REGION}" \
+  --project="${PROJECT_ID}" \
+  --update-env-vars="RECONCILE_MODE=full" \
+  --async \
+  --format="value(metadata.name)")
 
 echo "========================================================================="
-echo "🎉 全流程部署并校验成功！"
-echo "   Cloud Run Job:      ${JOB_NAME} (${REGION})"
-echo "   Cloud Scheduler:    ${SCHEDULER_JOB} (每日 UTC 00:30 执行)"
-echo "   日常运行耗时:       ~2.3 秒 (增量滑动窗口模式)"
+echo "🎉 部署完成并已启动首次全量调和！"
+echo "   作业名称:       ${JOB_NAME}"
+echo "   已触发全量执行: ${EXEC_NAME}"
+echo "   Cloud Scheduler: ${SCHEDULER_JOB} (日常定时模式: 增量滑动窗口)"
+echo "-------------------------------------------------------------------------"
+echo "💡 提示：该任务已在 GCP 后台异步运行，终端无需等待！"
+echo "   查看实时全量日志请在 GCP 控制台进入："
+echo "   Cloud Run -> Jobs (作业) -> ${JOB_NAME} -> Executions (执行)"
+echo "   或者执行命令查看："
+echo "   gcloud run jobs executions describe ${EXEC_NAME} --region=${REGION} --project=${PROJECT_ID}"
 echo "========================================================================="
