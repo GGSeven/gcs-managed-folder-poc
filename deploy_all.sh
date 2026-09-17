@@ -20,6 +20,11 @@ export BUCKET="${BUCKET:-gs://fr-xjsy-bigdata-gcs-dev}"     # 客户 Iceberg 存
 export DATA_ROOT_PREFIX="${DATA_ROOT_PREFIX:-datasets}"     # 存储桶内 Iceberg 根目录
 export HOT_DAYS="${HOT_DAYS:-60}"                           # 热数据保留天数 (与生命周期一致)
 
+# 🟡【库级黑白名单配置】（以英文逗号分隔，库名请带上 .db 后缀）
+# 规则：若设置了 INCLUDE_DBS，则仅处理白名单内的库；若留空，则处理除 EXCLUDE_DBS 之外的全部库
+export INCLUDE_DBS="${INCLUDE_DBS:-}"                      # 白名单示例: "ods.db,dwd.db,ads.db" (留空表示处理全部)
+export EXCLUDE_DBS="${EXCLUDE_DBS:-tmp.db,kafka_test.db}"  # 黑名单示例: "tmp.db,kafka_test.db" (排除这些库)
+
 # 🟢【默认建议保留项】（若客户有自定义 SA 名称可按需覆盖，否则默认自动拼装）
 export HOT_SA="${HOT_SA:-iceberg-hot-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
 export COLD_SA="${COLD_SA:-iceberg-cold-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
@@ -38,6 +43,8 @@ echo "   部署地域:      ${REGION}"
 echo "   目标存储桶:    ${BUCKET}"
 echo "   数据根目录:    ${DATA_ROOT_PREFIX}/"
 echo "   热数据阈值:    ${HOT_DAYS} 天"
+echo "   库白名单 (仅处理): ${INCLUDE_DBS:-[全部库]}"
+echo "   库黑名单 (排除库): ${EXCLUDE_DBS:-[无]}"
 echo "   运维服务账号:  ${OPS_SA}"
 echo "========================================================================="
 
@@ -411,7 +418,8 @@ COLD_SA: "${COLD_SA}"
 MAX_WORKERS: "30"
 RECONCILE_MODE: "incremental"
 SLIDING_LOOKBACK_DAYS: "3"
-EXCLUDE_DBS: "tmp.db,kafka_test.db"
+EXCLUDE_DBS: "${EXCLUDE_DBS}"
+INCLUDE_DBS: "${INCLUDE_DBS}"
 EOF_YAML
 
 # 部署或更新 Cloud Run Job（作业默认常驻配置为增量模式）
