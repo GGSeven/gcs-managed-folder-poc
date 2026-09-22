@@ -25,6 +25,9 @@ export HOT_DAYS="${HOT_DAYS:-60}"                           # 热数据保留天
 export INCLUDE_DBS="${INCLUDE_DBS:-}"                      # 白名单示例: "ods.db,dwd.db,ads.db" (留空表示处理全部)
 export EXCLUDE_DBS="${EXCLUDE_DBS:-tmp.db,kafka_test.db}"  # 黑名单示例: "tmp.db,kafka_test.db" (排除这些库)
 
+# 🟡【表级试点白名单配置】（以英文逗号分隔，支持精准试点单表，如 "ods_can_origin_data_1s_p_t_i"）
+export INCLUDE_TABLES="${INCLUDE_TABLES:-}"                # 试点表白名单（留空则处理库下全部表）
+
 # 🟢【默认建议保留项】（若客户有自定义 SA 名称可按需覆盖，否则默认自动拼装）
 export HOT_SA="${HOT_SA:-iceberg-hot-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
 export COLD_SA="${COLD_SA:-iceberg-cold-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
@@ -45,6 +48,7 @@ echo "   数据根目录:    ${DATA_ROOT_PREFIX}/"
 echo "   热数据阈值:    ${HOT_DAYS} 天"
 echo "   库白名单 (仅处理): ${INCLUDE_DBS:-[全部库]}"
 echo "   库黑名单 (排除库): ${EXCLUDE_DBS:-[无]}"
+echo "   表白名单 (试点表): ${INCLUDE_TABLES:-[库下全部表]}"
 echo "   运维服务账号:  ${OPS_SA}"
 echo "========================================================================="
 
@@ -162,10 +166,17 @@ COPY reconcile_fast.py /app/
 ENTRYPOINT ["python3", "reconcile_fast.py"]
 EOF_DOCKER
 
-cat << 'EOF_PY' > "${BUILD_DIR}/reconcile_fast.py"
+if [[ -f "reconcile_fast.py" ]]; then
+  echo "    ✔ 检测到本地最新 reconcile_fast.py，直接打包..."
+  cp "reconcile_fast.py" "${BUILD_DIR}/reconcile_fast.py"
+elif [[ -f "../reconcile_fast.py" ]]; then
+  echo "    ✔ 检测到上级目录 reconcile_fast.py，直接打包..."
+  cp "../reconcile_fast.py" "${BUILD_DIR}/reconcile_fast.py"
+else
+  cat << 'EOF_PY' > "${BUILD_DIR}/reconcile_fast.py"
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, sys, time, json, urllib.parse
+import os, sys, time, json, urllib.parse, re
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -191,6 +202,9 @@ SLIDING_LOOKBACK_DAYS = int(os.environ.get("SLIDING_LOOKBACK_DAYS", "3"))
 
 EXCLUDE_DBS = set(filter(None, os.environ.get("EXCLUDE_DBS", "tmp.db,kafka_test.db").split(",")))
 INCLUDE_DBS = set(filter(None, os.environ.get("INCLUDE_DBS", "").split(",")))
+INCLUDE_TABLES = set(filter(None, os.environ.get("INCLUDE_TABLES", "").split(",")))
+
+DATE_PATTERN = re.compile(r"(?:server_dt_utc|server_dt_local|car_dt_utc|car_dt_local|dt|date)=(\d{4}-\d{2}-\d{2})")
 
 API_BASE = f"https://storage.googleapis.com/storage/v1/b/{BUCKET_NAME}"
 
@@ -250,26 +264,47 @@ def set_managed_folder_iam(session, folder_path, sa_list, role="roles/storage.ob
 
 TODAY_EPOCH = time.time()
 
-def process_partition_task(session, part_path):
-    part_name = part_path.rstrip("/").split("/")[-1]
-    clean_date = part_name.replace("dt=", "")
+def process_partition_task(session, item):
+    if isinstance(item, tuple):
+        part_path, date_str = item
+    else:
+        part_path = item
+        m = DATE_PATTERN.search(part_path)
+        if not m:
+            return (part_path, "SKIP_NON_DATE")
+        date_str = m.group(1)
+
     try:
-        dt_epoch = datetime.strptime(clean_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+        dt_epoch = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
     except ValueError:
-        return (part_name, "SKIP_NON_DATE")
+        return (part_path, "SKIP_NON_DATE")
+
     age_days = (TODAY_EPOCH - dt_epoch) / 86400
     ensure_managed_folder(session, part_path)
     if age_days < HOT_DAYS:
         set_managed_folder_iam(session, part_path, [HOT_SA])
-        return (part_name, "HOT")
+        return (part_path, "HOT")
     else:
         set_managed_folder_iam(session, part_path, [COLD_SA])
-        return (part_name, "COLD")
+        return (part_path, "COLD")
 
 def process_table_prep(session, tbl):
     meta_path = f"{tbl}metadata/"
     ensure_managed_folder(session, meta_path)
     set_managed_folder_iam(session, meta_path, [HOT_SA, COLD_SA])
+
+    date_partitions = []
+    level1_prefixes = list_sub_prefixes(session, f"{tbl}data/")
+    for p1 in level1_prefixes:
+        m1 = DATE_PATTERN.search(p1)
+        if m1:
+            date_partitions.append((p1, m1.group(1)))
+        else:
+            level2_prefixes = list_sub_prefixes(session, p1)
+            for p2 in level2_prefixes:
+                m2 = DATE_PATTERN.search(p2)
+                if m2:
+                    date_partitions.append((p2, m2.group(1)))
 
     for offset in [0, 1]:
         d_str = datetime.fromtimestamp(TODAY_EPOCH + offset * 86400, timezone.utc).strftime("dt=%Y-%m-%d")
@@ -277,8 +312,7 @@ def process_table_prep(session, tbl):
         ensure_managed_folder(session, today_path)
         set_managed_folder_iam(session, today_path, [HOT_SA])
 
-    parts = list_sub_prefixes(session, f"{tbl}data/")
-    return parts
+    return date_partitions
 
 def main():
     print("=========================================================================", flush=True)
@@ -305,7 +339,14 @@ def main():
         tables = list_sub_prefixes(session, db)
         selected_tables.extend(tables)
 
-    print(f"✔ 扫描完成：共发现 {len(selected_tables)} 张业务表", flush=True)
+    if INCLUDE_TABLES:
+        selected_tables = [
+            tbl for tbl in selected_tables
+            if any(inc in tbl for inc in INCLUDE_TABLES)
+        ]
+        print(f"✔ 启用试点表过滤 (INCLUDE_TABLES): 过滤后处理 {len(selected_tables)} 张表 -> {selected_tables}", flush=True)
+    else:
+        print(f"✔ 扫描完成：共发现 {len(selected_tables)} 张业务表", flush=True)
 
     start_par = time.time()
     success_count = 0
@@ -329,8 +370,7 @@ def main():
         def exec_task(item):
             path, sa_list = item
             ensure_managed_folder(session, path)
-            ok = set_managed_folder_iam(session, path, sa_list)
-            return (path, ok)
+            return (path, set_managed_folder_iam(session, path, sa_list))
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(exec_task, t): t for t in tasks}
@@ -341,9 +381,8 @@ def main():
                 if success_count % 30 == 0 or success_count == total_units:
                     pct = (success_count / total_units) * 100
                     print(f"    ⏳ [增量进度] {success_count}/{total_units} ({pct:.1f}%) 已处理...", flush=True)
-
     else:
-        print(f"\n--> [阶段 2/3] 并发准备 {len(selected_tables)} 张表的 metadata 与今明两日写入分区...", flush=True)
+        print(f"\n--> [阶段 2/3] 多线程并发准备 {len(selected_tables)} 张表的分区与元数据...", flush=True)
         all_partitions = []
         tables_done = 0
 
@@ -353,35 +392,23 @@ def main():
                 parts = f.result()
                 all_partitions.extend(parts)
                 tables_done += 1
-                if tables_done % 10 == 0 or tables_done == len(selected_tables):
-                    print(f"    ⏳ [表扫描进度] 已扫描 {tables_done}/{len(selected_tables)} 张表 (已汇总 {len(all_partitions)} 个历史分区)...", flush=True)
+                if tables_done % 20 == 0 or tables_done == len(selected_tables):
+                    print(f"    ⏳ [表扫描进度] 已扫描 {tables_done}/{len(selected_tables)} 张表 (已汇总 {len(all_partitions)} 个分区)...", flush=True)
 
         total_units = len(all_partitions)
-        print(f"\n--> [阶段 3/3] 收集到全量分区总计: {total_units} 个，启动 {MAX_WORKERS} 线程池并发全量调和...", flush=True)
+        print(f"\n--> [阶段 3/3] 启动 {MAX_WORKERS} 线程高并发执行全量调和 (共 {total_units} 个分区)...", flush=True)
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(process_partition_task, session, p): p for p in all_partitions}
             for f in as_completed(futures):
-                try:
-                    f.result()
+                name, status = f.result()
+                if status in ("HOT", "COLD"):
                     success_count += 1
-                except Exception:
-                    pass
-
-                if success_count % 500 == 0 or success_count == total_units:
-                    pct = (success_count / max(total_units, 1)) * 100
-                    cur_elapsed = time.time() - start_par
-                    cur_speed = success_count / max(cur_elapsed, 0.1)
-                    remaining_sec = (total_units - success_count) / max(cur_speed, 1.0)
-                    print(
-                        f"    ⏳ [全量调和进度] {success_count}/{total_units} ({pct:5.1f}%) | "
-                        f"速度: {cur_speed:5.1f} 个/秒 | 预估剩余: {int(remaining_sec):3d} 秒...",
-                        flush=True
-                    )
+                if success_count % 50 == 0 or success_count == total_units:
+                    pct = (success_count / total_units) * 100 if total_units > 0 else 100.0
+                    print(f"    ⏳ [全量调和进度] {success_count}/{total_units} ({pct:5.1f}%) 已处理...", flush=True)
 
     elapsed_par = time.time() - start_par
-    elapsed_total = time.time() - start_total
-
     print("\n=========================================================================", flush=True)
     print(f"🎉 调和完成！模式: {RECONCILE_MODE.upper()} | 耗时: {elapsed_par:.2f} 秒 | 成功: {success_count}/{total_units}", flush=True)
     print("=========================================================================", flush=True)
@@ -389,6 +416,7 @@ def main():
 if __name__ == "__main__":
     main()
 EOF_PY
+fi
 
 cat << 'EOF_IGNORE' > "${BUILD_DIR}/.gcloudignore"
 .git
@@ -420,6 +448,7 @@ RECONCILE_MODE: "incremental"
 SLIDING_LOOKBACK_DAYS: "3"
 EXCLUDE_DBS: "${EXCLUDE_DBS}"
 INCLUDE_DBS: "${INCLUDE_DBS}"
+INCLUDE_TABLES: "${INCLUDE_TABLES}"
 EOF_YAML
 
 # 部署或更新 Cloud Run Job（作业默认常驻配置为增量模式）

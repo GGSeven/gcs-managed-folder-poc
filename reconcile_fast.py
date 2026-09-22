@@ -50,6 +50,9 @@ SLIDING_LOOKBACK_DAYS = int(os.environ.get("SLIDING_LOOKBACK_DAYS", "3"))
 
 EXCLUDE_DBS = set(filter(None, os.environ.get("EXCLUDE_DBS", "tmp.db,kafka_test.db").split(",")))
 INCLUDE_DBS = set(filter(None, os.environ.get("INCLUDE_DBS", "").split(",")))
+INCLUDE_TABLES = set(filter(None, os.environ.get("INCLUDE_TABLES", "").split(",")))
+
+DATE_PATTERN = re.compile(r"(?:server_dt_utc|server_dt_local|car_dt_utc|car_dt_local|dt|date)=(\d{4}-\d{2}-\d{2})")
 
 API_BASE = f"https://storage.googleapis.com/storage/v1/b/{BUCKET_NAME}"
 
@@ -136,42 +139,61 @@ def set_managed_folder_iam(session, folder_path, sa_list, role="roles/storage.ob
 
 TODAY_EPOCH = time.time()
 
-def process_partition_task(session, part_path):
-    part_name = part_path.rstrip("/").split("/")[-1]
-    clean_date = part_name.replace("dt=", "")
+def process_partition_task(session, item):
+    if isinstance(item, tuple):
+        part_path, date_str = item
+    else:
+        part_path = item
+        m = DATE_PATTERN.search(part_path)
+        if not m:
+            return (part_path, "SKIP_NON_DATE")
+        date_str = m.group(1)
+
     try:
-        dt_epoch = datetime.strptime(clean_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+        dt_epoch = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
     except ValueError:
-        return (part_name, "SKIP_NON_DATE")
+        return (part_path, "SKIP_NON_DATE")
 
     age_days = (TODAY_EPOCH - dt_epoch) / 86400
     ensure_managed_folder(session, part_path)
 
     if age_days < HOT_DAYS:
         set_managed_folder_iam(session, part_path, [HOT_SA])
-        return (part_name, "HOT")
+        return (part_path, "HOT")
     else:
         set_managed_folder_iam(session, part_path, [COLD_SA])
-        return (part_name, "COLD")
+        return (part_path, "COLD")
 
 
 def process_table_prep(session, tbl):
-    """并行处理单个表的 metadata 授权、预建今明两日热分区、并收集历史分区"""
+    """并行处理单个表的 metadata 授权、预建今明两日热分区、并收集历史多级分区"""
     # 1. 确保 metadata/ 读权限
     meta_path = f"{tbl}metadata/"
     ensure_managed_folder(session, meta_path)
     set_managed_folder_iam(session, meta_path, [HOT_SA, COLD_SA])
 
-    # 2. 预创建今天与明天
+    # 2. 收集数据分区 (支持单级 dt= 与多级如 country_code=xxx/server_dt_utc=xxx)
+    date_partitions = []
+    level1_prefixes = list_sub_prefixes(session, f"{tbl}data/")
+    for p1 in level1_prefixes:
+        m1 = DATE_PATTERN.search(p1)
+        if m1:
+            date_partitions.append((p1, m1.group(1)))
+        else:
+            level2_prefixes = list_sub_prefixes(session, p1)
+            for p2 in level2_prefixes:
+                m2 = DATE_PATTERN.search(p2)
+                if m2:
+                    date_partitions.append((p2, m2.group(1)))
+
+    # 3. 预创建今天与明天（通用兜底）
     for offset in [0, 1]:
         d_str = datetime.fromtimestamp(TODAY_EPOCH + offset * 86400, timezone.utc).strftime("dt=%Y-%m-%d")
         today_path = f"{tbl}data/{d_str}/"
         ensure_managed_folder(session, today_path)
         set_managed_folder_iam(session, today_path, [HOT_SA])
 
-    # 3. 收集历史分区
-    parts = list_sub_prefixes(session, f"{tbl}data/")
-    return parts
+    return date_partitions
 
 
 def main():
@@ -204,7 +226,14 @@ def main():
         tables = list_sub_prefixes(session, db)
         selected_tables.extend(tables)
 
-    print(f"✔ 扫描完成：共发现 {len(selected_tables)} 张业务表 (跳过黑名单库: {list(EXCLUDE_DBS) if EXCLUDE_DBS else '无'})", flush=True)
+    if INCLUDE_TABLES:
+        selected_tables = [
+            tbl for tbl in selected_tables
+            if any(inc in tbl for inc in INCLUDE_TABLES)
+        ]
+        print(f"✔ 启用试点表过滤 (INCLUDE_TABLES): 过滤后处理 {len(selected_tables)} 张表 -> {selected_tables}", flush=True)
+    else:
+        print(f"✔ 扫描完成：共发现 {len(selected_tables)} 张业务表 (跳过黑名单库: {list(EXCLUDE_DBS) if EXCLUDE_DBS else '无'})", flush=True)
 
     start_par = time.time()
     success_count = 0
