@@ -171,13 +171,14 @@ cat <<'PYEOF' > "${BUILD_DIR}/reconcile.py"
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os, sys, time, json, urllib.parse, re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 from requests.adapters import HTTPAdapter
 
 PROJECT_ID = os.environ.get("PROJECT_ID", "")
 BUCKET = os.environ.get("BUCKET", "")
 BUCKET_NAME = BUCKET.replace("gs://", "").strip("/")
+RECONCILE_MODE = os.environ.get("RECONCILE_MODE", "incremental").lower()
 DEFAULT_HOT_DAYS = int(os.environ.get("DEFAULT_HOT_DAYS", os.environ.get("HOT_DAYS", "60")))
 
 TABLE_RULES = {}
@@ -287,6 +288,7 @@ def main():
     print("=========================================================================", flush=True)
     print(f"🚀 GCS Managed Folder 目标表定向调和任务启动", flush=True)
     print(f"   项目: {PROJECT_ID} | 存储桶: {BUCKET_NAME}", flush=True)
+    print(f"   运行模式: {RECONCILE_MODE.upper()}", flush=True)
     print(f"   目标表白名单: {TARGET_TABLES}", flush=True)
     print(f"   保留期规则映射: {TABLE_RULES} (默认: {DEFAULT_HOT_DAYS} 天)", flush=True)
     print("=========================================================================", flush=True)
@@ -294,38 +296,84 @@ def main():
     token = get_access_token()
     session = build_http_session(token)
 
-    total_parts = 0
+    total_tasks = 0
     hot_count = 0
     cold_count = 0
 
-    for tbl_prefix in TARGET_TABLES:
-        tbl_path = f"{tbl_prefix}/" if not tbl_prefix.endswith("/") else tbl_prefix
-        tbl_name = tbl_path.rstrip("/").split("/")[-1]
-        hot_threshold = TABLE_RULES.get(tbl_name, DEFAULT_HOT_DAYS)
-
-        print(f"\n--> 开始处理目标表: {tbl_name} (阈值: {hot_threshold} 天)...", flush=True)
+    if RECONCILE_MODE == "incremental":
+        print("\n--> [增量模式] 基于滑动窗口计算精准目录 (T+0/T+1 热开通, T-阈值 冷沉降)...", flush=True)
+        now_utc = datetime.now(timezone.utc)
         
-        meta_path = f"{tbl_path}metadata/"
-        ensure_managed_folder(session, meta_path)
-        set_managed_folder_iam(session, meta_path, [HOT_SA, COLD_SA], "roles/storage.objectViewer")
-        print(f"    ✔ 元数据目录已就绪: {meta_path}", flush=True)
+        for tbl_prefix in TARGET_TABLES:
+            tbl_path = f"{tbl_prefix}/" if not tbl_prefix.endswith("/") else tbl_prefix
+            tbl_name = tbl_path.rstrip("/").split("/")[-1]
+            hot_threshold = TABLE_RULES.get(tbl_name, DEFAULT_HOT_DAYS)
+            print(f"\n  [表] {tbl_name} (阈值: {hot_threshold} 天):", flush=True)
 
-        data_prefix = f"{tbl_path}data/"
-        date_parts = find_date_partitions(session, data_prefix)
-        print(f"    ✔ 检索到 {len(date_parts)} 个日期分区...", flush=True)
+            # 1. 元数据放行
+            meta_path = f"{tbl_path}metadata/"
+            ensure_managed_folder(session, meta_path)
+            set_managed_folder_iam(session, meta_path, [HOT_SA, COLD_SA], "roles/storage.objectViewer")
 
-        for p in date_parts:
-            part_path, status, ok = process_partition(session, p, hot_threshold)
-            total_parts += 1
-            if status == "HOT":
-                hot_count += 1
-                print(f"    [HOT 放行]  {part_path} -> hot-reader (OK)", flush=True)
-            elif status == "COLD":
-                cold_count += 1
-                print(f"    [COLD 拦截] {part_path} -> cold-reader (OK)", flush=True)
+            # 2. 发现其下一级子前缀 (例如 country_code=XX/ 或直接日期)
+            data_prefix = f"{tbl_path}data/"
+            sub_prefixes = list_sub_prefixes(session, data_prefix)
+            if not sub_prefixes:
+                sub_prefixes = [data_prefix]
+
+            # 3. 对每个子分支应用滑动窗口
+            for parent_prefix in sub_prefixes:
+                # 热数据预开通 (今天 T+0 与 明天 T+1)
+                for offset in [0, 1]:
+                    d_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
+                    part_path = f"{parent_prefix}server_dt_utc={d_str}/"
+                    ensure_managed_folder(session, part_path)
+                    set_managed_folder_iam(session, part_path, [HOT_SA], "roles/storage.objectViewer")
+                    hot_count += 1
+                    total_tasks += 1
+                    print(f"    [HOT 增量放行]  {part_path} -> hot-reader (OK)", flush=True)
+
+                # 冷数据滑动沉降 (达到阈值后的 4 天窗口，从 HOT 翻转为 COLD 拦截)
+                for offset in range(hot_threshold, hot_threshold + 4):
+                    d_str = (now_utc - timedelta(days=offset)).strftime("%Y-%m-%d")
+                    part_path = f"{parent_prefix}server_dt_utc={d_str}/"
+                    ensure_managed_folder(session, part_path)
+                    set_managed_folder_iam(session, part_path, [COLD_SA], "roles/storage.objectViewer")
+                    cold_count += 1
+                    total_tasks += 1
+                    print(f"    [COLD 增量拦截] {part_path} -> cold-reader (OK)", flush=True)
+
+    else:
+        print("\n--> [全量模式] 递归检索目标表全部历史存量分区并执行冷热对齐...", flush=True)
+        for tbl_prefix in TARGET_TABLES:
+            tbl_path = f"{tbl_prefix}/" if not tbl_prefix.endswith("/") else tbl_prefix
+            tbl_name = tbl_path.rstrip("/").split("/")[-1]
+            hot_threshold = TABLE_RULES.get(tbl_name, DEFAULT_HOT_DAYS)
+
+            print(f"\n  [表] {tbl_name} (阈值: {hot_threshold} 天):", flush=True)
+            
+            # 元数据放行
+            meta_path = f"{tbl_path}metadata/"
+            ensure_managed_folder(session, meta_path)
+            set_managed_folder_iam(session, meta_path, [HOT_SA, COLD_SA], "roles/storage.objectViewer")
+
+            # 递归检索所有日期分区
+            data_prefix = f"{tbl_path}data/"
+            date_parts = find_date_partitions(session, data_prefix)
+            print(f"    ✔ 检索到存量历史分区: {len(date_parts)} 个", flush=True)
+
+            for p in date_parts:
+                part_path, status, ok = process_partition(session, p, hot_threshold)
+                total_tasks += 1
+                if status == "HOT":
+                    hot_count += 1
+                    print(f"    [HOT 全量放行]  {part_path} -> hot-reader (OK)", flush=True)
+                elif status == "COLD":
+                    cold_count += 1
+                    print(f"    [COLD 全量拦截] {part_path} -> cold-reader (OK)", flush=True)
 
     print("\n=========================================================================", flush=True)
-    print(f"🎉 调和完成！总分区数: {total_parts} | 热分区(放行): {hot_count} | 冷分区(拦截): {cold_count}", flush=True)
+    print(f"🎉 调和完成！模式: {RECONCILE_MODE.upper()} | 处理项: {total_tasks} | 放行项: {hot_count} | 拦截项: {cold_count}", flush=True)
     print("=========================================================================", flush=True)
 
 if __name__ == "__main__":
@@ -357,6 +405,7 @@ COLD_SA: "${COLD_SA}"
 TARGET_TABLES: "${TARGET_TABLES}"
 TABLE_RETENTION: "${TABLE_RETENTION}"
 DEFAULT_HOT_DAYS: "${DEFAULT_HOT_DAYS}"
+RECONCILE_MODE: "incremental"
 EOF
 
 if gcloud run jobs describe "${JOB_NAME}" --region="${REGION}" &>/dev/null; then
@@ -420,9 +469,10 @@ fi
 # 8. 触发首次全量定向调和 (异步执行，不卡死 Cloud Shell)
 # ------------------------------------------------------------------------------
 echo -e "\n========================================================================="
-echo "🎉 部署全部成功！触发首次定向调和任务..."
+echo "🎉 部署全部成功！触发首次【全量历史对齐】调和任务 (RECONCILE_MODE=full)..."
 echo "========================================================================="
-gcloud run jobs execute "${JOB_NAME}" --region="${REGION}" --async
+gcloud run jobs execute "${JOB_NAME}" --region="${REGION}" --update-env-vars="RECONCILE_MODE=full" --async
 
 echo -e "\n✔ 任务已进入后台执行！您可以随时运行以下命令查看实时调和日志："
 echo "   gcloud logging read 'resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${JOB_NAME}\"' --limit 20 --format='value(textPayload)'"
+echo -e "\nℹ️ 后续每日凌晨 02:00 UTC，Cloud Scheduler 将以【增量滑动窗口模式 (RECONCILE_MODE=incremental)】自动执行！"
