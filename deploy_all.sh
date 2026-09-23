@@ -170,28 +170,46 @@ BUILD_DIR=$(mktemp -d)
 cat <<'PYEOF' > "${BUILD_DIR}/reconcile.py"
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+企业级高性能 GCS Managed Folder 调和引擎 (多线程 + 全量/增量双模 + 多级嵌套分区)
+"""
 import os, sys, time, json, urllib.parse, re
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
-from requests.adapters import HTTPAdapter
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+except ImportError:
+    print("错误: 缺少 requests 库，请先执行: pip install requests", flush=True)
+    sys.exit(1)
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 PROJECT_ID = os.environ.get("PROJECT_ID", "")
 BUCKET = os.environ.get("BUCKET", "")
 BUCKET_NAME = BUCKET.replace("gs://", "").strip("/")
 DEFAULT_HOT_DAYS = int(os.environ.get("DEFAULT_HOT_DAYS", os.environ.get("HOT_DAYS", "60")))
 RECONCILE_MODE = os.environ.get("RECONCILE_MODE", "incremental").lower()
+SLIDING_LOOKBACK_DAYS = int(os.environ.get("SLIDING_LOOKBACK_DAYS", "3"))
 
 TABLE_RULES = {}
 raw_rules = os.environ.get("TABLE_RETENTION", "")
 if raw_rules:
-    for item in raw_rules.split(","):
+    for item in re.split(r"[,;]", raw_rules):
         if ":" in item:
             k, v = item.strip().split(":")
             TABLE_RULES[k.strip()] = int(v.strip())
 
 raw_tables = os.environ.get("TARGET_TABLES", "")
-TARGET_TABLES = [t.strip().strip("/") for t in raw_tables.split(",") if t.strip()]
+if raw_tables:
+    TARGET_TABLES = [t.strip().strip("/") for t in re.split(r"[,;]", raw_tables) if t.strip()]
+else:
+    TARGET_TABLES = []
 
 HOT_SA = os.environ.get("HOT_SA", "")
 COLD_SA = os.environ.get("COLD_SA", "")
@@ -200,22 +218,30 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "30"))
 API_BASE = f"https://storage.googleapis.com/storage/v1/b/{BUCKET_NAME}"
 DATE_REGEX = re.compile(r"(?:server_dt_utc|dt)=(\d{4}-\d{2}-\d{2})")
 
+AUX_DIRECTORIES = {
+    "user/spark/": ("roles/storage.objectViewer", [HOT_SA]),
+    "flink_jar/": ("roles/storage.objectViewer", [HOT_SA]),
+    "spark-job-history/": ("roles/storage.objectUser", [HOT_SA]),
+    "spark-tmp/": ("roles/storage.objectUser", [HOT_SA]),
+}
+
 def get_access_token():
     env_token = os.environ.get("GCS_TOKEN") or os.environ.get("ACCESS_TOKEN")
     if env_token:
         return env_token.strip()
-    try:
-        r = requests.get(
-            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-            headers={"Metadata-Flavor": "Google"},
-            timeout=3
-        )
-        if r.status_code == 200:
-            return r.json().get("access_token")
-    except Exception:
-        pass
+    if sys.platform != "win32" or os.environ.get("K_SERVICE") or os.environ.get("CLOUD_RUN_JOB"):
+        try:
+            r = requests.get(
+                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+                headers={"Metadata-Flavor": "Google"},
+                timeout=2
+            )
+            if r.status_code == 200:
+                return r.json().get("access_token")
+        except Exception:
+            pass
     import subprocess
-    return subprocess.check_output(["gcloud", "auth", "print-access-token"], text=True).strip()
+    return subprocess.check_output(["gcloud", "auth", "print-access-token"], text=True, shell=(sys.platform == "win32")).strip()
 
 def build_http_session(token):
     session = requests.Session()
@@ -231,7 +257,7 @@ def list_sub_prefixes(session, prefix):
         url = f"{API_BASE}/o?prefix={prefix}&delimiter=/&fields=prefixes,nextPageToken"
         if page_token:
             url += f"&pageToken={page_token}"
-        resp = session.get(url, timeout=15)
+        resp = session.get(url, timeout=12)
         if resp.status_code != 200:
             break
         data = resp.json()
@@ -253,8 +279,7 @@ def set_managed_folder_iam(session, folder_path, sa_list, role="roles/storage.ob
     resp = session.put(url, json=body, timeout=10)
     return resp.status_code == 200
 
-def find_date_partitions_full(session, base_prefix, depth=1, max_depth=4):
-    """【全量模式】递归检索所有存在的历史日期分区"""
+def find_date_partitions_recursive(session, base_prefix, depth=1, max_depth=4):
     results = []
     sub_prefixes = list_sub_prefixes(session, base_prefix)
     for p in sub_prefixes:
@@ -262,121 +287,124 @@ def find_date_partitions_full(session, base_prefix, depth=1, max_depth=4):
         if match:
             results.append(p)
         elif depth < max_depth:
-            results.extend(find_date_partitions_full(session, p, depth + 1, max_depth))
+            results.extend(find_date_partitions_recursive(session, p, depth + 1, max_depth))
     return results
 
-def find_date_partitions_incremental(session, base_prefix, hot_threshold):
-    """【增量模式】智能滑动窗口：定位中间维度(如country_code)，仅比对最近新数据(T+0~T-2)与临界沉降期(T-threshold+-2)"""
-    results = set()
-    now_utc = datetime.now(timezone.utc)
-    # 构造增量目标日期集合：新写入窗口 + 临界老化下沉窗口
-    target_dates = set()
-    for offset in range(-2, 2): # 今天、昨天、前天、明天
-        target_dates.add((now_utc + timedelta(days=offset)).strftime("%Y-%m-%d"))
-    for offset in range(hot_threshold - 2, hot_threshold + 3): # 60/90天老化沉降临界点
-        target_dates.add((now_utc - timedelta(days=offset)).strftime("%Y-%m-%d"))
-
-    # 发现第一层中间前缀 (如 country_code=XX/)
-    first_level = list_sub_prefixes(session, base_prefix)
-    has_date_in_first = any(DATE_REGEX.search(p) for p in first_level)
-
-    if has_date_in_first:
-        # 没有多级中间层，直接是日期目录
-        for p in first_level:
-            m = DATE_REGEX.search(p)
-            if m and m.group(1) in target_dates:
-                results.add(p)
-    else:
-        # 存在 country_code 等多级中间层
-        for sub_dir in first_level:
-            sub_parts = list_sub_prefixes(session, sub_dir)
-            for p in sub_parts:
-                m = DATE_REGEX.search(p)
-                if m and m.group(1) in target_dates:
-                    results.add(p)
-    return list(results)
-
-TODAY_EPOCH = time.time()
-
-def process_partition(session, part_path, hot_days_threshold):
-    match = DATE_REGEX.search(part_path)
-    if not match:
-        return (part_path, "SKIP_NO_DATE", False)
-    d_str = match.group(1)
-    try:
-        dt_epoch = datetime.strptime(d_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
-    except ValueError:
-        return (part_path, "SKIP_BAD_DATE", False)
-
-    age_days = (TODAY_EPOCH - dt_epoch) / 86400
+def reconcile_single_partition_task(args):
+    session, part_path, target_sa, role = args
     ensure_managed_folder(session, part_path)
-    if age_days < hot_days_threshold:
-        ok = set_managed_folder_iam(session, part_path, [HOT_SA], "roles/storage.objectViewer")
-        return (part_path, "HOT", ok)
-    else:
-        ok = set_managed_folder_iam(session, part_path, [COLD_SA], "roles/storage.objectViewer")
-        return (part_path, "COLD", ok)
+    ok = set_managed_folder_iam(session, part_path, [target_sa], role)
+    return part_path, ok
 
-def main():
+def run_reconcile():
     print("=========================================================================", flush=True)
-    print(f"🚀 GCS Managed Folder 调和引擎启动 (并发线程数: {MAX_WORKERS})", flush=True)
+    print(f"🚀 企业级 GCS Managed Folder 调和引擎启动 ({MAX_WORKERS}线程并发加速)", flush=True)
     print(f"   项目: {PROJECT_ID} | 存储桶: {BUCKET_NAME}", flush=True)
-    print(f"   运行模式: 【{RECONCILE_MODE.upper()}】", flush=True)
-    print(f"   目标表白名单: {TARGET_TABLES}", flush=True)
+    print(f"   运行模式: {RECONCILE_MODE.upper()}", flush=True)
+    print(f"   管控表清单: {TARGET_TABLES}", flush=True)
     print(f"   保留期规则映射: {TABLE_RULES} (默认兜底: {DEFAULT_HOT_DAYS} 天)", flush=True)
     print("=========================================================================", flush=True)
 
     token = get_access_token()
     session = build_http_session(token)
+    start_time = time.time()
 
-    total_parts = 0
-    hot_count = 0
-    cold_count = 0
+    print("\n--> [阶段 1/3] 检查并配置 Spark/Kyuubi 辅助依赖与日志临时目录...", flush=True)
+    for aux_path, (role, sa_list) in AUX_DIRECTORIES.items():
+        ensure_managed_folder(session, aux_path)
+        ok = set_managed_folder_iam(session, aux_path, sa_list, role)
+        print(f"    ✔ 辅助目录 [{aux_path}] -> 角色: {role} (状态: {'OK' if ok else 'FAIL'})", flush=True)
 
-    for tbl_prefix in TARGET_TABLES:
-        tbl_path = f"{tbl_prefix}/" if not tbl_prefix.endswith("/") else tbl_prefix
-        tbl_name = tbl_path.rstrip("/").split("/")[-1]
-        hot_threshold = TABLE_RULES.get(tbl_name, DEFAULT_HOT_DAYS)
+    tasks = []
+    today_epoch = time.time()
+    now_utc = datetime.now(timezone.utc)
 
-        print(f"\n--> 开始处理目标表: {tbl_name} (阈值: {hot_threshold} 天)...", flush=True)
-        
-        # 1. 元数据放行
-        meta_path = f"{tbl_path}metadata/"
-        ensure_managed_folder(session, meta_path)
-        set_managed_folder_iam(session, meta_path, [HOT_SA, COLD_SA], "roles/storage.objectViewer")
-        print(f"    ✔ 元数据目录已就绪: {meta_path}", flush=True)
+    if RECONCILE_MODE == "incremental":
+        print(f"\n--> [阶段 2/3] 组装【增量滑动窗口】调和任务 (极速跳过历史扫描)...", flush=True)
+        for tbl_prefix in TARGET_TABLES:
+            tbl_path = f"{tbl_prefix}/" if not tbl_prefix.endswith("/") else tbl_prefix
+            tbl_name = tbl_path.rstrip("/").split("/")[-1]
+            hot_threshold = TABLE_RULES.get(tbl_name, DEFAULT_HOT_DAYS)
 
-        # 2. 检索分区 (根据全量/增量模式分别处理)
-        data_prefix = f"{tbl_path}data/"
-        if RECONCILE_MODE == "full":
-            date_parts = find_date_partitions_full(session, data_prefix)
-            print(f"    ✔ [全量模式] 深度检索到 {len(date_parts)} 个历史日期分区...", flush=True)
-        else:
-            date_parts = find_date_partitions_incremental(session, data_prefix, hot_threshold)
-            print(f"    ✔ [增量模式] 滑动窗口定位到 {len(date_parts)} 个目标增量/沉降分区...", flush=True)
+            tasks.append((session, f"{tbl_path}metadata/", HOT_SA, "roles/storage.objectViewer"))
+            tasks.append((session, f"{tbl_path}metadata/", COLD_SA, "roles/storage.objectViewer"))
 
-        # 3. 多线程并发处理 Managed Folder 创建与 IAM 授权
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(process_partition, session, p, hot_threshold): p for p in date_parts}
-            for f in as_completed(futures):
+            sub_prefixes = list_sub_prefixes(session, f"{tbl_path}data/")
+            parent_prefixes = []
+            if any(DATE_REGEX.search(p) for p in sub_prefixes):
+                parent_prefixes.append(f"{tbl_path}data/")
+            else:
+                parent_prefixes.extend(sub_prefixes)
+
+            for parent in parent_prefixes:
+                date_key = "server_dt_utc" if "ods_can_" in tbl_name else "dt"
+                for offset in [0, 1]:
+                    d_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
+                    p_path = f"{parent}{date_key}={d_str}/"
+                    tasks.append((session, p_path, HOT_SA, "roles/storage.objectViewer"))
+                for offset in range(hot_threshold, hot_threshold + SLIDING_LOOKBACK_DAYS):
+                    d_str = (now_utc - timedelta(days=offset)).strftime("%Y-%m-%d")
+                    p_path = f"{parent}{date_key}={d_str}/"
+                    tasks.append((session, p_path, COLD_SA, "roles/storage.objectViewer"))
+    else:
+        print(f"\n--> [阶段 2/3] 扫描目标表全量分区结构 (全量递归扫描)...", flush=True)
+        for tbl_prefix in TARGET_TABLES:
+            tbl_path = f"{tbl_prefix}/" if not tbl_prefix.endswith("/") else tbl_prefix
+            tbl_name = tbl_path.rstrip("/").split("/")[-1]
+            hot_threshold = TABLE_RULES.get(tbl_name, DEFAULT_HOT_DAYS)
+
+            tasks.append((session, f"{tbl_path}metadata/", HOT_SA, "roles/storage.objectViewer"))
+            tasks.append((session, f"{tbl_path}metadata/", COLD_SA, "roles/storage.objectViewer"))
+
+            date_parts = find_date_partitions_recursive(session, f"{tbl_path}data/")
+            print(f"    ✔ 目标表 [{tbl_name}] 发现 {len(date_parts)} 个历史分区 (阈值: {hot_threshold} 天)", flush=True)
+
+            for p in date_parts:
+                match = DATE_REGEX.search(p)
+                if not match:
+                    continue
+                d_str = match.group(1)
                 try:
-                    part_path, status, ok = f.result()
-                    total_parts += 1
-                    if status == "HOT":
-                        hot_count += 1
-                        print(f"    [HOT 放行]  {part_path} -> hot-reader (OK)", flush=True)
-                    elif status == "COLD":
-                        cold_count += 1
-                        print(f"    [COLD 拦截] {part_path} -> cold-reader (OK)", flush=True)
-                except Exception as e:
-                    print(f"    ✘ [ERROR] 处理分区失败: {e}", flush=True)
+                    dt_epoch = datetime.strptime(d_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    continue
+                age_days = (today_epoch - dt_epoch) / 86400
+                if age_days < hot_threshold:
+                    tasks.append((session, p, HOT_SA, "roles/storage.objectViewer"))
+                else:
+                    tasks.append((session, p, COLD_SA, "roles/storage.objectViewer"))
 
+    total_tasks = len(tasks)
+    print(f"\n--> [阶段 3/3] 启动 {MAX_WORKERS} 线程池并发调和 {total_tasks} 个分区控制项...", flush=True)
+    success_count = 0
+    start_worker_time = time.time()
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(reconcile_single_partition_task, t): t for t in tasks}
+        for f in as_completed(futures):
+            try:
+                part_path, ok = f.result()
+                if ok:
+                    success_count += 1
+            except Exception:
+                pass
+
+            if success_count % 50 == 0 or success_count == total_tasks:
+                elapsed = time.time() - start_worker_time
+                pct = (success_count / max(total_tasks, 1)) * 100
+                speed = success_count / max(elapsed, 0.05)
+                eta = (total_tasks - success_count) / max(speed, 1.0)
+                print(f"    ⏳ [{RECONCILE_MODE.upper()}调和进度] {success_count}/{total_tasks} ({pct:5.1f}%) | 速度: {speed:5.1f} 个/秒 | 预估剩余: {int(eta):2d} 秒", flush=True)
+
+    elapsed_total = time.time() - start_time
     print("\n=========================================================================", flush=True)
-    print(f"🎉 调和完成！模式: {RECONCILE_MODE.upper()} | 处理分区: {total_parts} | 热分区: {hot_count} | 冷分区: {cold_count}", flush=True)
+    print(f"🎉 调和完成！模式: {RECONCILE_MODE.upper()}", flush=True)
+    print(f"   成功处理分区/目录数: {success_count} / {total_tasks}", flush=True)
+    print(f"   总耗时: {elapsed_total:.2f} 秒 (并发速率: {total_tasks/max(elapsed_total, 0.01):.1f} 操作/秒)", flush=True)
     print("=========================================================================", flush=True)
 
 if __name__ == "__main__":
-    main()
+    run_reconcile()
 PYEOF
 
 cat <<'DOCKEREOF' > "${BUILD_DIR}/Dockerfile"
@@ -406,6 +434,7 @@ TABLE_RETENTION: "${TABLE_RETENTION}"
 DEFAULT_HOT_DAYS: "${DEFAULT_HOT_DAYS}"
 RECONCILE_MODE: "incremental"
 MAX_WORKERS: "30"
+SLIDING_LOOKBACK_DAYS: "3"
 EOF
 
 if gcloud run jobs describe "${JOB_NAME}" --region="${REGION}" &>/dev/null; then
@@ -469,7 +498,7 @@ fi
 # 8. 触发首次全量定向调和 (异步执行，不卡死 Cloud Shell)
 # ------------------------------------------------------------------------------
 echo -e "\n========================================================================="
-echo "🎉 部署全部成功！触发首次全量定向调和任务..."
+echo "🎉 部署全部成功！触发首次定向调和任务..."
 echo "========================================================================="
 gcloud run jobs execute "${JOB_NAME}" --region="${REGION}" --update-env-vars="RECONCILE_MODE=full" --async
 
