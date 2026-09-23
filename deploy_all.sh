@@ -4,20 +4,22 @@
 # ==============================================================================
 set -euo pipefail
 
-# 脚本所在目录
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 # ------------------------------------------------------------------------------
 # 1. 基础配置与环境变量读取 (支持纯 export，无需 .env 文件)
 # ------------------------------------------------------------------------------
-PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null)}"
+PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}"
 if [ -z "${PROJECT_ID}" ]; then
-  echo "错误: 未能获取到当前 GCP 项目 ID，请先执行: export PROJECT_ID='your-project-id'"
+  echo "✘ 错误: 未检测到 GCP Project ID，请先执行: export PROJECT_ID=\"your-project-id\""
   exit 1
 fi
 
 REGION="${REGION:-us-central1}"
 BUCKET="${BUCKET:-gs://${PROJECT_ID}-mf-poc}"
+if [[ "${BUCKET}" != gs://* ]]; then
+  echo "✘ 错误: BUCKET 必须以 gs:// 开头，当前为: ${BUCKET}"
+  exit 1
+fi
+
 BUCKET_NAME="${BUCKET#gs://}"
 BUCKET_NAME="${BUCKET_NAME%/}"
 
@@ -42,7 +44,6 @@ IMAGE_NAME="gcr.io/${PROJECT_ID}/gcs-mf-reconciler:latest"
 echo "========================================================================="
 echo "🚀 启动 GCS Managed Folder 精准调和自动化部署"
 echo "   项目 ID:     ${PROJECT_ID}"
-echo "   部署地域:    ${REGION}"
 echo "   目标存储桶:  ${BUCKET}"
 echo "   管控表范围:  ${TARGET_TABLES}"
 echo "   保留期配置:  ${TABLE_RETENTION} (默认兜底: ${DEFAULT_HOT_DAYS} 天)"
@@ -53,7 +54,7 @@ echo "========================================================================="
 # ------------------------------------------------------------------------------
 # 2. 检查存储桶 UBLA 状态
 # ------------------------------------------------------------------------------
-echo "--> [1/6] 检查存储桶 Uniform Bucket-Level Access (UBLA)..."
+echo -e "\n--> [1/6] 检查存储桶 Uniform Bucket-Level Access (UBLA)..."
 UBLA_STATUS=$(gcloud storage buckets describe "${BUCKET}" --format="value(uniform_bucket_level_access)" 2>/dev/null || true)
 if [ "${UBLA_STATUS}" != "True" ] && [ "${UBLA_STATUS}" != "enabled" ]; then
   echo "    ✔ 启用存储桶 UBLA..."
@@ -65,7 +66,7 @@ fi
 # ------------------------------------------------------------------------------
 # 3. 幂等性创建 Service Accounts 与 IAM 角色
 # ------------------------------------------------------------------------------
-echo "--> [2/6] 检查并初始化 IAM 服务账号与角色..."
+echo -e "\n--> [2/6] 检查并初始化 IAM 服务账号与角色..."
 create_sa_if_not_exists() {
   local sa_email="$1"
   local sa_id="${sa_email%%@*}"
@@ -107,14 +108,12 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 # ------------------------------------------------------------------------------
 # 4. 初始化根级与 Spark 辅助依赖 Managed Folders
 # ------------------------------------------------------------------------------
-echo "--> [3/6] 初始化 GCS Managed Folder 顶层策略与 Spark 辅助依赖放行..."
-
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "${TMP_DIR}"' EXIT
+echo -e "\n--> [3/6] 初始化 GCS Managed Folder 顶层策略与 Spark 辅助依赖放行..."
+TMP_POL=$(mktemp)
 
 # 1. 顶层 datasets/
 gcloud storage managed-folders create "${BUCKET}/datasets/" &>/dev/null || true
-cat <<EOF > "${TMP_DIR}/datasets_policy.json"
+cat <<EOF > "${TMP_POL}"
 {
   "bindings": [
     {"role": "roles/storage.objectAdmin", "members": ["serviceAccount:${WRITER_SA}"]},
@@ -122,51 +121,47 @@ cat <<EOF > "${TMP_DIR}/datasets_policy.json"
   ]
 }
 EOF
-gcloud storage managed-folders set-iam-policy "${BUCKET}/datasets/" "${TMP_DIR}/datasets_policy.json" >/dev/null
+gcloud storage managed-folders set-iam-policy "${BUCKET}/datasets/" "${TMP_POL}" >/dev/null
 echo "    ✔ 顶层目录 datasets/ 基础策略配置完成。"
 
 # 2. Spark/Kyuubi 依赖 (user/spark/ 与 flink_jar/)
-cat <<EOF > "${TMP_DIR}/dep_policy.json"
+cat <<EOF > "${TMP_POL}"
 {
   "bindings": [
     {"role": "roles/storage.objectViewer", "members": ["serviceAccount:${HOT_SA}"]}
   ]
 }
 EOF
-
 for dep_path in "user/spark/" "flink_jar/"; do
   gcloud storage managed-folders create "${BUCKET}/${dep_path}" &>/dev/null || true
-  gcloud storage managed-folders set-iam-policy "${BUCKET}/${dep_path}" "${TMP_DIR}/dep_policy.json" >/dev/null
+  gcloud storage managed-folders set-iam-policy "${BUCKET}/${dep_path}" "${TMP_POL}" >/dev/null
   echo "    ✔ 依赖目录 [${dep_path}] 已对 hot-reader 放行只读。"
 done
 
 # 3. Spark 日志与上传临时目录 (spark-job-history/ 与 spark-tmp/)
-cat <<EOF > "${TMP_DIR}/rw_policy.json"
+cat <<EOF > "${TMP_POL}"
 {
   "bindings": [
     {"role": "roles/storage.objectUser", "members": ["serviceAccount:${HOT_SA}"]}
   ]
 }
 EOF
-
 for rw_path in "spark-job-history/" "spark-tmp/"; do
   gcloud storage managed-folders create "${BUCKET}/${rw_path}" &>/dev/null || true
-  gcloud storage managed-folders set-iam-policy "${BUCKET}/${rw_path}" "${TMP_DIR}/rw_policy.json" >/dev/null
+  gcloud storage managed-folders set-iam-policy "${BUCKET}/${rw_path}" "${TMP_POL}" >/dev/null
   echo "    ✔ 临时与日志目录 [${rw_path}] 已对 hot-reader 放行读写。"
 done
+rm -f "${TMP_POL}"
 
 # ------------------------------------------------------------------------------
 # 5. 构建隔离 Docker 上下文并提交 Cloud Build
 # ------------------------------------------------------------------------------
-echo "--> [4/6] 准备独立构建上下文并编译容器镜像..."
-BUILD_DIR="${TMP_DIR}/build"
-mkdir -p "${BUILD_DIR}"
+echo -e "\n--> [4/6] 准备独立构建上下文并编译容器镜像..."
+BUILD_DIR=$(mktemp -d)
 
-if [ -f "${SCRIPT_DIR}/reconcile_customer.py" ]; then
-  cp "${SCRIPT_DIR}/reconcile_customer.py" "${BUILD_DIR}/reconcile.py"
-else
-  # 兜底：如果本地不存在单独文件，生成最小化调和引擎
-  cat << 'PYEOF' > "${BUILD_DIR}/reconcile.py"
+cat <<'PYEOF' > "${BUILD_DIR}/reconcile.py"
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import os, sys, time, json, urllib.parse, re
 from datetime import datetime, timezone
 import requests
@@ -328,7 +323,6 @@ def main():
 if __name__ == "__main__":
     main()
 PYEOF
-fi
 
 cat <<'DOCKEREOF' > "${BUILD_DIR}/Dockerfile"
 FROM python:3.11-slim
@@ -340,11 +334,12 @@ DOCKEREOF
 
 echo "    ✔ 提交 Cloud Build 编译镜像..."
 gcloud builds submit "${BUILD_DIR}" --tag "${IMAGE_NAME}" --quiet
+rm -rf "${BUILD_DIR}"
 
 # ------------------------------------------------------------------------------
 # 6. 部署 / 更新 Cloud Run Job (注入环境变量供调试)
 # ------------------------------------------------------------------------------
-echo "--> [5/6] 部署 / 更新 Cloud Run Job (${JOB_NAME})..."
+echo -e "\n--> [5/6] 部署 / 更新 Cloud Run Job (${JOB_NAME})..."
 if gcloud run jobs describe "${JOB_NAME}" --region="${REGION}" &>/dev/null; then
   echo "    ✔ 更新现有 Cloud Run Job..."
   gcloud run jobs update "${JOB_NAME}" \
@@ -376,7 +371,7 @@ fi
 # ------------------------------------------------------------------------------
 # 7. 配置 Cloud Scheduler 定时触发
 # ------------------------------------------------------------------------------
-echo "--> [6/6] 配置 Cloud Scheduler 每日定时任务 (${SCHEDULER_JOB_NAME})..."
+echo -e "\n--> [6/6] 配置 Cloud Scheduler 每日定时任务 (${SCHEDULER_JOB_NAME})..."
 RUN_JOB_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${JOB_NAME}:run"
 
 if gcloud scheduler jobs describe "${SCHEDULER_JOB_NAME}" --location="${REGION}" &>/dev/null; then
