@@ -52,17 +52,9 @@ echo "   Cold Reader: ${COLD_SA}"
 echo "========================================================================="
 
 # ------------------------------------------------------------------------------
-# 2. 清理旧版本遗留 Job 与定时器 (避免双 Job 并行冲突)
+# 2. 检查存储桶 UBLA 状态
 # ------------------------------------------------------------------------------
-echo -e "\n--> [1/7] 检查并清理旧版本 Job (mf-reconcile)..."
-gcloud scheduler jobs delete mf-reconcile-daily --location="${REGION}" --quiet &>/dev/null || true
-gcloud run jobs delete mf-reconcile --region="${REGION}" --quiet &>/dev/null || true
-echo "    ✔ 旧版本作业与触发器清理完成。"
-
-# ------------------------------------------------------------------------------
-# 3. 检查存储桶 UBLA 状态
-# ------------------------------------------------------------------------------
-echo -e "\n--> [2/7] 检查存储桶 Uniform Bucket-Level Access (UBLA)..."
+echo -e "\n--> [1/6] 检查存储桶 Uniform Bucket-Level Access (UBLA)..."
 UBLA_STATUS=$(gcloud storage buckets describe "${BUCKET}" --format="value(uniform_bucket_level_access)" 2>/dev/null || true)
 if [ "${UBLA_STATUS}" != "True" ] && [ "${UBLA_STATUS}" != "enabled" ]; then
   echo "    ✔ 启用存储桶 UBLA..."
@@ -291,9 +283,9 @@ def find_date_partitions_recursive(session, base_prefix, depth=1, max_depth=4):
     return results
 
 def reconcile_single_partition_task(args):
-    session, part_path, target_sa, role = args
+    session, part_path, sa_list, role = args
     ensure_managed_folder(session, part_path)
-    ok = set_managed_folder_iam(session, part_path, [target_sa], role)
+    ok = set_managed_folder_iam(session, part_path, sa_list, role)
     return part_path, ok
 
 def run_reconcile():
@@ -326,8 +318,8 @@ def run_reconcile():
             tbl_name = tbl_path.rstrip("/").split("/")[-1]
             hot_threshold = TABLE_RULES.get(tbl_name, DEFAULT_HOT_DAYS)
 
-            tasks.append((session, f"{tbl_path}metadata/", HOT_SA, "roles/storage.objectViewer"))
-            tasks.append((session, f"{tbl_path}metadata/", COLD_SA, "roles/storage.objectViewer"))
+            # 元数据常驻只读 (必须将两角色的权限绑定在同一策略内下发)
+            tasks.append((session, f"{tbl_path}metadata/", [HOT_SA, COLD_SA], "roles/storage.objectViewer"))
 
             sub_prefixes = list_sub_prefixes(session, f"{tbl_path}data/")
             parent_prefixes = []
@@ -337,14 +329,15 @@ def run_reconcile():
                 parent_prefixes.extend(sub_prefixes)
 
             for parent in parent_prefixes:
+                date_key = "server_dt_utc"
                 for offset in [0, 1]:
                     d_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
-                    p_path = f"{parent}server_dt_utc={d_str}/"
-                    tasks.append((session, p_path, HOT_SA, "roles/storage.objectViewer"))
+                    p_path = f"{parent}{date_key}={d_str}/"
+                    tasks.append((session, p_path, [HOT_SA], "roles/storage.objectViewer"))
                 for offset in range(hot_threshold, hot_threshold + SLIDING_LOOKBACK_DAYS):
                     d_str = (now_utc - timedelta(days=offset)).strftime("%Y-%m-%d")
-                    p_path = f"{parent}server_dt_utc={d_str}/"
-                    tasks.append((session, p_path, COLD_SA, "roles/storage.objectViewer"))
+                    p_path = f"{parent}{date_key}={d_str}/"
+                    tasks.append((session, p_path, [COLD_SA], "roles/storage.objectViewer"))
     else:
         print(f"\n--> [阶段 2/3] 扫描目标表全量分区结构 (全量递归扫描)...", flush=True)
         for tbl_prefix in TARGET_TABLES:
@@ -352,8 +345,7 @@ def run_reconcile():
             tbl_name = tbl_path.rstrip("/").split("/")[-1]
             hot_threshold = TABLE_RULES.get(tbl_name, DEFAULT_HOT_DAYS)
 
-            tasks.append((session, f"{tbl_path}metadata/", HOT_SA, "roles/storage.objectViewer"))
-            tasks.append((session, f"{tbl_path}metadata/", COLD_SA, "roles/storage.objectViewer"))
+            tasks.append((session, f"{tbl_path}metadata/", [HOT_SA, COLD_SA], "roles/storage.objectViewer"))
 
             date_parts = find_date_partitions_recursive(session, f"{tbl_path}data/")
             print(f"    ✔ 目标表 [{tbl_name}] 发现 {len(date_parts)} 个历史分区 (阈值: {hot_threshold} 天)", flush=True)
@@ -369,9 +361,9 @@ def run_reconcile():
                     continue
                 age_days = (today_epoch - dt_epoch) / 86400
                 if age_days < hot_threshold:
-                    tasks.append((session, p, HOT_SA, "roles/storage.objectViewer"))
+                    tasks.append((session, p, [HOT_SA], "roles/storage.objectViewer"))
                 else:
-                    tasks.append((session, p, COLD_SA, "roles/storage.objectViewer"))
+                    tasks.append((session, p, [COLD_SA], "roles/storage.objectViewer"))
 
     total_tasks = len(tasks)
     print(f"\n--> [阶段 3/3] 启动 {MAX_WORKERS} 线程池并发调和 {total_tasks} 个分区控制项...", flush=True)

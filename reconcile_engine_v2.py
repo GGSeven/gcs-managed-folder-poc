@@ -139,9 +139,9 @@ def find_date_partitions_recursive(session, base_prefix, depth=1, max_depth=4):
     return results
 
 def reconcile_single_partition_task(args):
-    session, part_path, target_sa, role = args
+    session, part_path, sa_list, role = args
     ensure_managed_folder(session, part_path)
-    ok = set_managed_folder_iam(session, part_path, [target_sa], role)
+    ok = set_managed_folder_iam(session, part_path, sa_list, role)
     return part_path, ok
 
 def run_reconcile():
@@ -176,9 +176,8 @@ def run_reconcile():
             tbl_name = tbl_path.rstrip("/").split("/")[-1]
             hot_threshold = TABLE_RULES.get(tbl_name, DEFAULT_HOT_DAYS)
 
-            # 元数据常驻只读
-            tasks.append((session, f"{tbl_path}metadata/", HOT_SA, "roles/storage.objectViewer"))
-            tasks.append((session, f"{tbl_path}metadata/", COLD_SA, "roles/storage.objectViewer"))
+            # 元数据常驻只读 (必须将两角色的权限绑定在同一策略内下发)
+            tasks.append((session, f"{tbl_path}metadata/", [HOT_SA, COLD_SA], "roles/storage.objectViewer"))
 
             # 探测该表下的一级分区前缀 (如 country_code=XX/ 或直接是日期)
             sub_prefixes = list_sub_prefixes(session, f"{tbl_path}data/")
@@ -189,16 +188,17 @@ def run_reconcile():
                 parent_prefixes.extend(sub_prefixes)
 
             for parent in parent_prefixes:
+                date_key = "server_dt_utc"
                 # T+0 (今天) 与 T+1 (明天) 预建放行
                 for offset in [0, 1]:
                     d_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
-                    p_path = f"{parent}server_dt_utc={d_str}/"
-                    tasks.append((session, p_path, HOT_SA, "roles/storage.objectViewer"))
+                    p_path = f"{parent}{date_key}={d_str}/"
+                    tasks.append((session, p_path, [HOT_SA], "roles/storage.objectViewer"))
                 # T-(hot_days) 到 T-(hot_days + lookback) 翻转为冷数据拦截
                 for offset in range(hot_threshold, hot_threshold + SLIDING_LOOKBACK_DAYS):
                     d_str = (now_utc - timedelta(days=offset)).strftime("%Y-%m-%d")
-                    p_path = f"{parent}server_dt_utc={d_str}/"
-                    tasks.append((session, p_path, COLD_SA, "roles/storage.objectViewer"))
+                    p_path = f"{parent}{date_key}={d_str}/"
+                    tasks.append((session, p_path, [COLD_SA], "roles/storage.objectViewer"))
 
     else:
         # FULL 模式：递归扫描两张目标表的全部历史分区
@@ -208,8 +208,7 @@ def run_reconcile():
             tbl_name = tbl_path.rstrip("/").split("/")[-1]
             hot_threshold = TABLE_RULES.get(tbl_name, DEFAULT_HOT_DAYS)
 
-            tasks.append((session, f"{tbl_path}metadata/", HOT_SA, "roles/storage.objectViewer"))
-            tasks.append((session, f"{tbl_path}metadata/", COLD_SA, "roles/storage.objectViewer"))
+            tasks.append((session, f"{tbl_path}metadata/", [HOT_SA, COLD_SA], "roles/storage.objectViewer"))
 
             date_parts = find_date_partitions_recursive(session, f"{tbl_path}data/")
             print(f"    ✔ 目标表 [{tbl_name}] 发现 {len(date_parts)} 个历史分区 (阈值: {hot_threshold} 天)", flush=True)
@@ -225,9 +224,9 @@ def run_reconcile():
                     continue
                 age_days = (today_epoch - dt_epoch) / 86400
                 if age_days < hot_threshold:
-                    tasks.append((session, p, HOT_SA, "roles/storage.objectViewer"))
+                    tasks.append((session, p, [HOT_SA], "roles/storage.objectViewer"))
                 else:
-                    tasks.append((session, p, COLD_SA, "roles/storage.objectViewer"))
+                    tasks.append((session, p, [COLD_SA], "roles/storage.objectViewer"))
 
     # 3. 30 线程并发执行调和任务
     total_tasks = len(tasks)
