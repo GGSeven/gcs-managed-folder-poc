@@ -337,9 +337,20 @@ gcloud builds submit "${BUILD_DIR}" --tag "${IMAGE_NAME}" --quiet
 rm -rf "${BUILD_DIR}"
 
 # ------------------------------------------------------------------------------
-# 6. 部署 / 更新 Cloud Run Job (注入环境变量供调试)
+# 6. 部署 / 更新 Cloud Run Job (通过 YAML 传入环境变量，彻底解决逗号分隔解析问题)
 # ------------------------------------------------------------------------------
 echo -e "\n--> [5/6] 部署 / 更新 Cloud Run Job (${JOB_NAME})..."
+ENV_YAML_FILE=$(mktemp)
+cat <<EOF > "${ENV_YAML_FILE}"
+PROJECT_ID: "${PROJECT_ID}"
+BUCKET: "${BUCKET}"
+HOT_SA: "${HOT_SA}"
+COLD_SA: "${COLD_SA}"
+TARGET_TABLES: "${TARGET_TABLES}"
+TABLE_RETENTION: "${TABLE_RETENTION}"
+DEFAULT_HOT_DAYS: "${DEFAULT_HOT_DAYS}"
+EOF
+
 if gcloud run jobs describe "${JOB_NAME}" --region="${REGION}" &>/dev/null; then
   echo "    ✔ 更新现有 Cloud Run Job..."
   gcloud run jobs update "${JOB_NAME}" \
@@ -351,7 +362,7 @@ if gcloud run jobs describe "${JOB_NAME}" --region="${REGION}" &>/dev/null; then
     --memory=2Gi \
     --max-retries=2 \
     --task-timeout=3600 \
-    --set-env-vars="PROJECT_ID=${PROJECT_ID},BUCKET=${BUCKET},HOT_SA=${HOT_SA},COLD_SA=${COLD_SA},TARGET_TABLES=${TARGET_TABLES},TABLE_RETENTION=${TABLE_RETENTION},DEFAULT_HOT_DAYS=${DEFAULT_HOT_DAYS}" \
+    --env-vars-file="${ENV_YAML_FILE}" \
     --quiet
 else
   echo "    ✔ 创建全新 Cloud Run Job..."
@@ -364,9 +375,10 @@ else
     --memory=2Gi \
     --max-retries=2 \
     --task-timeout=3600 \
-    --set-env-vars="PROJECT_ID=${PROJECT_ID},BUCKET=${BUCKET},HOT_SA=${HOT_SA},COLD_SA=${COLD_SA},TARGET_TABLES=${TARGET_TABLES},TABLE_RETENTION=${TABLE_RETENTION},DEFAULT_HOT_DAYS=${DEFAULT_HOT_DAYS}" \
+    --env-vars-file="${ENV_YAML_FILE}" \
     --quiet
 fi
+rm -f "${ENV_YAML_FILE}"
 
 # ------------------------------------------------------------------------------
 # 7. 配置 Cloud Scheduler 定时触发
