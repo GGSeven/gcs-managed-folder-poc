@@ -216,7 +216,7 @@ COLD_SA = os.environ.get("COLD_SA", "")
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "30"))
 
 API_BASE = f"https://storage.googleapis.com/storage/v1/b/{BUCKET_NAME}"
-DATE_REGEX = re.compile(r"(?:server_dt_utc|dt)=(\d{4}-\d{2}-\d{2})")
+DATE_REGEX = re.compile(r"server_dt_utc=(\d{4}-\d{2}-\d{2})")
 
 AUX_DIRECTORIES = {
     "user/spark/": ("roles/storage.objectViewer", [HOT_SA]),
@@ -337,14 +337,13 @@ def run_reconcile():
                 parent_prefixes.extend(sub_prefixes)
 
             for parent in parent_prefixes:
-                date_key = "server_dt_utc" if "ods_can_" in tbl_name else "dt"
                 for offset in [0, 1]:
                     d_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
-                    p_path = f"{parent}{date_key}={d_str}/"
+                    p_path = f"{parent}server_dt_utc={d_str}/"
                     tasks.append((session, p_path, HOT_SA, "roles/storage.objectViewer"))
                 for offset in range(hot_threshold, hot_threshold + SLIDING_LOOKBACK_DAYS):
                     d_str = (now_utc - timedelta(days=offset)).strftime("%Y-%m-%d")
-                    p_path = f"{parent}{date_key}={d_str}/"
+                    p_path = f"{parent}server_dt_utc={d_str}/"
                     tasks.append((session, p_path, COLD_SA, "roles/storage.objectViewer"))
     else:
         print(f"\n--> [阶段 2/3] 扫描目标表全量分区结构 (全量递归扫描)...", flush=True)

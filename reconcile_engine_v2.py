@@ -59,7 +59,7 @@ COLD_SA = os.environ.get("COLD_SA", f"iceberg-cold-reader@{PROJECT_ID}.iam.gserv
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "30"))
 
 API_BASE = f"https://storage.googleapis.com/storage/v1/b/{BUCKET_NAME}"
-DATE_REGEX = re.compile(r"(?:server_dt_utc|dt)=(\d{4}-\d{2}-\d{2})")
+DATE_REGEX = re.compile(r"server_dt_utc=(\d{4}-\d{2}-\d{2})")
 
 AUX_DIRECTORIES = {
     "user/spark/": ("roles/storage.objectViewer", [HOT_SA]),
@@ -189,17 +189,15 @@ def run_reconcile():
                 parent_prefixes.extend(sub_prefixes)
 
             for parent in parent_prefixes:
-                # 判定日期变量名称前缀
-                date_key = "server_dt_utc" if "ods_can_" in tbl_name else "dt"
                 # T+0 (今天) 与 T+1 (明天) 预建放行
                 for offset in [0, 1]:
                     d_str = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
-                    p_path = f"{parent}{date_key}={d_str}/"
+                    p_path = f"{parent}server_dt_utc={d_str}/"
                     tasks.append((session, p_path, HOT_SA, "roles/storage.objectViewer"))
                 # T-(hot_days) 到 T-(hot_days + lookback) 翻转为冷数据拦截
                 for offset in range(hot_threshold, hot_threshold + SLIDING_LOOKBACK_DAYS):
                     d_str = (now_utc - timedelta(days=offset)).strftime("%Y-%m-%d")
-                    p_path = f"{parent}{date_key}={d_str}/"
+                    p_path = f"{parent}server_dt_utc={d_str}/"
                     tasks.append((session, p_path, COLD_SA, "roles/storage.objectViewer"))
 
     else:

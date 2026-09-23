@@ -53,7 +53,7 @@ AUX_DIRECTORIES = {
 
 API_BASE = f"https://storage.googleapis.com/storage/v1/b/{BUCKET_NAME}"
 
-DATE_REGEX = re.compile(r"(?:server_dt_utc|dt)=(\d{4}-\d{2}-\d{2})")
+DATE_REGEX = re.compile(r"server_dt_utc=(\d{4}-\d{2}-\d{2})")
 
 def get_access_token():
     env_token = os.environ.get("GCS_TOKEN") or os.environ.get("ACCESS_TOKEN")
