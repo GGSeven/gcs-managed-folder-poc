@@ -52,9 +52,17 @@ echo "   Cold Reader: ${COLD_SA}"
 echo "========================================================================="
 
 # ------------------------------------------------------------------------------
-# 2. 检查存储桶 UBLA 状态
+# 2. 清理旧版本遗留 Job 与定时器 (避免双 Job 并行冲突)
 # ------------------------------------------------------------------------------
-echo -e "\n--> [1/6] 检查存储桶 Uniform Bucket-Level Access (UBLA)..."
+echo -e "\n--> [1/7] 检查并清理旧版本 Job (mf-reconcile)..."
+gcloud scheduler jobs delete mf-reconcile-daily --location="${REGION}" --quiet &>/dev/null || true
+gcloud run jobs delete mf-reconcile --region="${REGION}" --quiet &>/dev/null || true
+echo "    ✔ 旧版本作业与触发器清理完成。"
+
+# ------------------------------------------------------------------------------
+# 3. 检查存储桶 UBLA 状态
+# ------------------------------------------------------------------------------
+echo -e "\n--> [2/7] 检查存储桶 Uniform Bucket-Level Access (UBLA)..."
 UBLA_STATUS=$(gcloud storage buckets describe "${BUCKET}" --format="value(uniform_bucket_level_access)" 2>/dev/null || true)
 if [ "${UBLA_STATUS}" != "True" ] && [ "${UBLA_STATUS}" != "enabled" ]; then
   echo "    ✔ 启用存储桶 UBLA..."
